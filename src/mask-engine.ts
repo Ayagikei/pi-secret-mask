@@ -69,9 +69,10 @@ function builtinPatterns(opts: MaskOptions["patterns"]): { name: string; re: Reg
     if (enabled) out.push({ name, re: new RegExp(source, flags) });
   };
   add("OPENAI", opts.openai, "sk-[A-Za-z0-9_-]{20,}");
-  add("GITHUB", opts.github, "(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}");
+  add("GITHUB", opts.github, "(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}");
   add("GOOGLE", opts.google, "AIza[0-9A-Za-z_-]{35}");
   add("AWS", opts.aws, "(?:AKIA|ASIA|AIDA)[0-9A-Z]{16}");
+  add("AWS_SK", opts.aws, `"?(?:SecretAccessKey|SessionToken)"?\s*[:=]\s*"?([A-Za-z0-9+/=]{20,})"`);
   add("JWT", opts.jwt, "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}");
   add("PEM", opts.pem, "-----BEGIN [A-Z ]*PRIVATE KEY-----\\s*[A-Za-z0-9+/=\\s]+?-----END [A-Z ]*PRIVATE KEY-----");
   add("BASE64", opts.base64, `[A-Za-z0-9+/]{${opts.base64MinLength},}={0,2}`);
@@ -147,23 +148,35 @@ export function collectPatternSecrets(patterns: { name: string; re: RegExp }[], 
 
 /** Placeholder shape (prevents already-masked content from being re-collected). */
 const PLACEHOLDER_RE = /^__SECRET_[A-Za-z0-9_]+(__\d+)?__$/;
+/** Characters allowed in placeholder names (dotenv keys, pattern names). */
+const NAME_RE = /^[A-Za-z0-9_]+$/;
+
+/** Sanitize a name into a safe placeholder fragment. */
+export function sanitizeName(name: string): string {
+  return NAME_RE.test(name) ? name : name.replace(/[^A-Za-z0-9_]/g, "_") || "SECRET";
+}
 
 /** Masking map: maintains secret <-> placeholder. */
 export class MaskMap {
   private secretToPlaceholder = new Map<string, string>();
   private placeholderToSecret = new Map<string, string>();
-  private nameCounts = new Map<string, number>();
+  private usedPlaceholders = new Set<string>();
   /** Secrets sorted by length descending (for alternation construction). */
   private sortedSecrets: string[] = [];
 
-  /** Register a secret. Same-name values are auto-numbered. Returns the placeholder. */
+  /** Register a secret. Placeholders are globally unique. Returns the placeholder. */
   add(secret: string, baseName: string): string {
     const existing = this.secretToPlaceholder.get(secret);
     if (existing) return existing;
     if (PLACEHOLDER_RE.test(secret)) return secret; // never re-register placeholders
-    const n = (this.nameCounts.get(baseName) ?? 0) + 1;
-    this.nameCounts.set(baseName, n);
-    const placeholder = n === 1 ? `__SECRET_${baseName}__` : `__SECRET_${baseName}_${n}__`;
+    const name = sanitizeName(baseName);
+    let placeholder = `__SECRET_${name}__`;
+    let n = 1;
+    while (this.usedPlaceholders.has(placeholder)) {
+      n++;
+      placeholder = `__SECRET_${name}_${n}__`;
+    }
+    this.usedPlaceholders.add(placeholder);
     this.secretToPlaceholder.set(secret, placeholder);
     this.placeholderToSecret.set(placeholder, secret);
     this.sortedSecrets = [...this.secretToPlaceholder.keys()].sort((a, b) => b.length - a.length);
@@ -176,6 +189,7 @@ export class MaskMap {
     if (!ph) return;
     this.secretToPlaceholder.delete(secret);
     this.placeholderToSecret.delete(ph);
+    this.usedPlaceholders.delete(ph);
     this.sortedSecrets = [...this.secretToPlaceholder.keys()].sort((a, b) => b.length - a.length);
   }
 
@@ -234,7 +248,10 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Walk objects/arrays and apply fn to string fields. Returns whether anything changed. */
+/**
+ * Walk objects/arrays and apply fn to string fields. Returns whether anything changed.
+ * Image/binary nodes (type "image"/"input_image") are skipped so base64 data is never touched.
+ */
 export function maskDeep(value: unknown, fn: (text: string) => string): boolean {
   if (typeof value === "string") return false; // string containers are handled by the caller
   if (Array.isArray(value)) {
@@ -248,12 +265,14 @@ export function maskDeep(value: unknown, fn: (text: string) => string): boolean 
           changed = true;
         }
       } else if (item && typeof item === "object") {
+        if (isImageNode(item)) continue; // never touch image payloads
         changed = maskDeep(item, fn) || changed;
       }
     }
     return changed;
   }
   if (value && typeof value === "object") {
+    if (isImageNode(value)) return false;
     let changed = false;
     for (const key of Object.keys(value as Record<string, unknown>)) {
       const item = (value as Record<string, unknown>)[key];
@@ -272,6 +291,17 @@ export function maskDeep(value: unknown, fn: (text: string) => string): boolean 
   return false;
 }
 
+/** Detect provider image content nodes (Anthropic/OpenAI/Google style). */
+function isImageNode(v: Record<string, unknown>): boolean {
+  const t = v.type;
+  if (t === "image" || t === "input_image" || t === "image_url") return true;
+  if (typeof v.source === "object" && v.source !== null) {
+    const s = v.source as Record<string, unknown>;
+    if (s.type === "base64" || s.type === "url" || s.type === "bytes") return true;
+  }
+  return false;
+}
+
 /** Collect secrets from text: built-in patterns + custom regexes. */
 export function collectSecretsFromText(
   text: string,
@@ -280,7 +310,9 @@ export function collectSecretsFromText(
   const patterns: { name: string; re: RegExp }[] = builtinPatterns(opts.patterns);
   for (const cp of opts.customPatterns) {
     try {
-      patterns.push({ name: cp.name, re: new RegExp(cp.pattern, cp.flags ?? "g") });
+      // Force global flag: collectPatternSecrets loops exec() which requires /g.
+      const flags = (cp.flags ?? "").includes("g") ? cp.flags! : (cp.flags ?? "") + "g";
+      patterns.push({ name: cp.name, re: new RegExp(cp.pattern, flags) });
     } catch {
       // Ignore invalid custom regexes.
     }

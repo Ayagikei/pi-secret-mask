@@ -202,3 +202,60 @@ test("maskDeep: write/edit content unmasked (placeholder -> real value)", () => 
   m.unmaskDeep(input);
   assert.equal(input.content, "OPENAI_API_KEY=sk-real-1234567890abcdef\nTEST=1");
 });
+
+test("MaskMap: placeholders are globally unique across names", () => {
+  const m = new MaskMap();
+  m.add("v1", "FOO");
+  m.add("v2", "FOO");
+  m.add("v3", "FOO_2"); // name collides with auto-numbered FOO_2
+  assert.equal(m.placeholderFor("v1"), "__SECRET_FOO__");
+  assert.equal(m.placeholderFor("v2"), "__SECRET_FOO_2__");
+  assert.notEqual(m.placeholderFor("v3"), "__SECRET_FOO_2__"); // must not collide
+  const ph3 = m.placeholderFor("v3");
+  assert.equal(m.secretFor(ph3), "v3");
+  assert.equal(m.unmask(m.mask("v1 v2 v3")), "v1 v2 v3");
+});
+
+test("maskDeep: image nodes are skipped (base64 data untouched)", () => {
+  const m = new MaskMap();
+  m.add("short", "K"); // short value would match base64 fragments
+  const obj = {
+    content: [
+      { type: "text", text: "short value here" },
+      { type: "image", source: { type: "base64", data: "short AAAA short BBBB" } },
+      { type: "input_image", image_url: "short CCCC" },
+    ],
+  };
+  m.maskDeep(obj);
+  assert.equal(obj.content[0].text, "__SECRET_K__ value here");
+  assert.equal(obj.content[1].source.data, "short AAAA short BBBB"); // untouched
+  assert.equal(obj.content[2].image_url, "short CCCC"); // untouched
+});
+
+test("collectSecretsFromText: custom regex without g flag is forced to global", () => {
+  const opts = {
+    extraSecrets: [],
+    customPatterns: [{ name: "MY", pattern: "mysec-[a-z0-9]{4}", flags: "" }], // no g
+    dotenv: { enabled: false, files: [], exclude: [] },
+    patterns: { openai: false, github: false, google: false, aws: false, jwt: false, pem: false, base64: false },
+    base64MinLength: 32,
+  };
+  const sources = collectSecretsFromText("a mysec-abcd b mysec-efgh", opts);
+  assert.equal(sources.length, 1);
+  assert.deepEqual(sources[0].values.sort(), ["mysec-abcd", "mysec-efgh"]); // both found
+});
+
+test("collectPatternSecrets: AWS SecretAccessKey/SessionToken captured", () => {
+  const opts = {
+    extraSecrets: [],
+    customPatterns: [],
+    dotenv: { enabled: false, files: [], exclude: [] },
+    patterns: { openai: false, github: false, google: false, aws: true, jwt: false, pem: false, base64: false },
+    base64MinLength: 32,
+  };
+  const json = '{"AccessKeyId":"AKIAIOSFODNN7EXAMPLE","SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","SessionToken":"FwoGZXIvYXdzEBMaDHLz6jZEXAMPLE"}';
+  const sources = collectSecretsFromText(json, opts);
+  const names = sources.map((s) => s.name);
+  assert.ok(names.includes("AWS"));       // AccessKeyId
+  assert.ok(names.includes("AWS_SK"));    // SecretAccessKey + SessionToken
+});
