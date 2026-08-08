@@ -140,7 +140,7 @@ export default function (pi: any) {
           if (value) {
             userSecrets.set(name, value);
             map.add(value, name);
-            addSource(value, "user");
+            addSource(value, `user:${name}`);
           }
         }
       }
@@ -186,6 +186,20 @@ export default function (pi: any) {
     }
   }
 
+  /** Register a user secret under a name; re-registering the same name drops the old value's user source (P1-10). */
+  function registerUserSecret(name: string, value: string): string {
+    const prev = userSecrets.get(name);
+    if (prev !== undefined && prev !== value) {
+      // Old value keeps other sources (dotenv/extra/regex/seen) but loses "user".
+      dropSource(prev, `user:${name}`);
+    }
+    userSecrets.set(name, value);
+    const ph = map.add(value, name);
+    addSource(value, `user:${name}`);
+    saveUserSecrets();
+    return ph;
+  }
+
   function refreshDotenv(baseDir: string): void {
     if (!options.dotenv.enabled) return;
     const files = options.dotenv.files.filter((f) => !options.dotenv.exclude.includes(f));
@@ -203,13 +217,11 @@ export default function (pi: any) {
       }
       scanned.set(path, mtime);
     }
-    // A file that disappeared is a change: drop its record so it reloads when back.
+    // A file that disappeared is a change; detect it, but do NOT commit
+    // anything yet — commit only after a successful read (P0-3).
     let changed = false;
     for (const [path, mtime] of dotenvMtimes) {
-      if (!seen.has(path)) {
-        dotenvMtimes.delete(path);
-        changed = true;
-      }
+      if (!seen.has(path)) changed = true;
     }
     for (const [path, mtime] of scanned) {
       if (dotenvMtimes.get(path) !== mtime) changed = true;
@@ -223,13 +235,15 @@ export default function (pi: any) {
       // mtime, so we retry next request; never abort the provider hook).
       return;
     }
-    // Commit the mtimes we observed during scanning (not a fresh stat, which
-    // could race a concurrent write — P0-3).
+    // All reads succeeded: commit the observed state in one shot.
+    for (const [path, mtime] of dotenvMtimes) {
+      if (!seen.has(path)) dotenvMtimes.delete(path);
+    }
     for (const [path, mtime] of scanned) {
       dotenvMtimes.set(path, mtime);
     }
     // Add new .env secrets; drop .env source from secrets that are no longer
-    // provided. Secrets with other remaining sources (user/extra/regex) stay.
+    // provided. Secrets with other remaining sources (user/extra/regex/seen) stay.
     for (const [key, value] of entries) {
       if (!map.has(value)) {
         map.add(value, key);
@@ -260,6 +274,14 @@ export default function (pi: any) {
       } else if (Array.isArray(m.parts)) {
         // Gemini contents[]: { role, parts: [...] }.
         maskBlocks(m.parts);
+      } else if (m.type === "function_call_output" && typeof m.output === "string") {
+        // OpenAI Responses input blocks (P0-9).
+        m.output = maskText(m.output);
+      } else if (m.type === "function_call" && typeof m.arguments === "string") {
+        // Function arguments are JSON text that may embed secrets.
+        m.arguments = maskText(m.arguments);
+      } else if (m.type === "message" && Array.isArray(m.content)) {
+        maskBlocks(m.content);
       }
     }
   }
@@ -275,7 +297,15 @@ export default function (pi: any) {
         if (map.has(value)) addSource(value, `regex:${src.name}`);
       }
     }
-    return map.mask(text);
+    const masked = map.mask(text);
+    // P0-8: any secret that actually matched gets a session-level "seen"
+    // source, so history containing it stays masked even if .env rotates.
+    if (masked !== text) {
+      for (const secret of map.placeholders().map((ph) => map.secretFor(ph)!)) {
+        if (secret && text.includes(secret)) addSource(secret, "seen");
+      }
+    }
+    return masked;
   }
 
   /**
@@ -316,11 +346,23 @@ export default function (pi: any) {
   /** Mask text content blocks; only the text field is touched, structural fields stay. */
   function maskBlocks(blocks: any[]): void {
     for (const block of blocks) {
-      if (block && typeof block === "object" && typeof block.text === "string") {
+      if (!block || typeof block !== "object") continue;
+      if (typeof block.text === "string") {
         block.text = maskText(block.text);
       }
-      // Other block types (image, tool_use, tool_result, etc.) are skipped:
-      // their string fields are structural, not free text.
+      // Known provider free-text paths (P0-9):
+      // Anthropic tool_result.content (string or nested blocks), OpenAI
+      // Responses function_call_output.output, Gemini functionResponse.response.output.
+      if (typeof block.output === "string") block.output = maskText(block.output);
+      if (block.response && typeof block.response === "object" && typeof block.response.output === "string") {
+        block.response.output = maskText(block.response.output);
+      }
+      if (typeof block.content === "string") {
+        block.content = maskText(block.content);
+      } else if (Array.isArray(block.content)) {
+        maskBlocks(block.content);
+      }
+      // Other block types are skipped: their string fields are structural.
     }
   }
 
@@ -362,12 +404,14 @@ export default function (pi: any) {
       const unmasked = map.unmask(command);
       if (mode === "ask") {
         const allowed = allowCommands.some((pat) => {
-          if (command.startsWith(pat)) return true;
+          let re: RegExp | null = null;
           try {
-            return new RegExp(pat).test(command);
+            re = new RegExp(pat);
           } catch {
-            return false; // invalid pattern in config: never allow via it
+            // Invalid pattern in config: must never allow anything (P1-2).
+            return false;
           }
+          return command.startsWith(pat) || re.test(command);
         });
         if (!allowed) {
           const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
@@ -468,10 +512,7 @@ export default function (pi: any) {
         ctx.ui.notify("No secret provided, cancelled", "warning");
         return;
       }
-      const ph = map.add(value, name);
-      userSecrets.set(name, value);
-      addSource(value, "user");
-      saveUserSecrets();
+      const ph = registerUserSecret(name, value);
       ctx.ui.notify(`Registered ${name} → ${ph} (agent sees placeholder only)`, "info");
     },
   });
@@ -512,10 +553,7 @@ Use case: tasks that require a secret from the user to continue.`,
           content: [{ type: "text" as const, text: `User cancelled input for ${name}` }],
         };
       }
-      const ph = map.add(value.trim(), name);
-      userSecrets.set(name, value.trim());
-      addSource(value.trim(), "user");
-      saveUserSecrets();
+      const ph = registerUserSecret(name, value.trim());
       return {
         content: [{ type: "text" as const, text: `Registered ${name}. Use placeholder ${ph} instead of the real value (bash/write substitute automatically). The real value is never exposed to you.` }],
       };

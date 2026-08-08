@@ -37,24 +37,25 @@ function makeMockPi() {
 }
 
 async function loadExtension(tmp: string, config?: object) {
-  // The extension reads config from USER_CONFIG_FILE
-  // (~/.pi/agent/extensions/pi-secret-mask/config.json) or its own directory.
-  // Write the real user config location so config-driven tests are hermetic
-  // per-run; restore afterward.
-  const userCfgDir = join(process.env.HOME!, ".pi", "agent", "extensions", "pi-secret-mask");
-  mkdirSync(userCfgDir, { recursive: true });
-  const cfgPath = join(userCfgDir, "config.json");
-  const prev = existsSync(cfgPath) ? readFileSync(cfgPath, "utf-8") : null;
-  if (config !== undefined) writeFileSync(cfgPath, JSON.stringify(config));
-  else if (existsSync(cfgPath)) rmSync(cfgPath);
+  // Hermetic: point $HOME at a temp dir so USER_CONFIG_FILE and
+  // USER_SECRETS_FILE resolve inside the test sandbox, never the real
+  // ~/.pi/agent. The extension reads homedir() at load time.
+  const home = mkdtempSync(join(tmpdir(), "psm-home-"));
+  const cfgDir = join(home, ".pi", "agent", "extensions", "pi-secret-mask");
+  mkdirSync(cfgDir, { recursive: true });
+  if (config !== undefined) {
+    writeFileSync(join(cfgDir, "config.json"), JSON.stringify(config));
+  }
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
   try {
-    const mod = await import("../extensions/pi-secret-mask.ts");
+    // Bust the module cache: each loadExtension gets a fresh extension state.
+    const mod = await import(`../extensions/pi-secret-mask.ts?t=${Date.now()}-${Math.random()}`);
     const pi = makeMockPi();
     mod.default(pi);
-    return pi;
+    return { pi, home };
   } finally {
-    if (prev !== null) writeFileSync(cfgPath, prev);
-    else if (existsSync(cfgPath)) rmSync(cfgPath);
+    process.env.HOME = prevHome;
   }
 }
 
@@ -63,7 +64,7 @@ test("extension: before_provider_request masks messages + system + tools and ret
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   writeFileSync(join(tmp, ".env"), "OPENAI_API_KEY=sk-ext-test-key-1234567890abcd\n");
 
-  const pi = await loadExtension(tmp, { mode: "auto" });
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
   const handlers = pi.handlers.get("before_provider_request");
   assert.ok(handlers?.length, "before_provider_request handler registered");
 
@@ -95,7 +96,7 @@ test("extension: Gemini contents[].parts[].text and config.systemInstruction are
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   writeFileSync(join(tmp, ".env"), "GKEY=AIzaSyExtTestKey1234567890abcdefghijklmnopqrstuvwxyz\n");
 
-  const pi = await loadExtension(tmp, { mode: "auto" });
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
   const handlers = pi.handlers.get("before_provider_request");
   const payload: any = {
     model: "gemini-x",
@@ -124,7 +125,7 @@ test("extension: tool_call unmask bash + write, block dangerous shell values", a
   const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
   writeFileSync(join(tmp, ".env"), "SAFE=abc12345\nBAD=abc 123\n");
-  const pi = await loadExtension(tmp, { mode: "auto" });
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
   // Prime the map: refreshDotenv runs on before_provider_request.
   for (const h of pi.handlers.get("before_provider_request") ?? []) {
     await h({ type: "before_provider_request", payload: { model: "x", messages: [] } }, { cwd: tmp });
@@ -155,6 +156,82 @@ test("extension: tool_call unmask bash + write, block dangerous shell values", a
 test("extension: config validation — null extraSecrets element does not crash", async (t) => {
   const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
-  const pi = await loadExtension(tmp, { extraSecrets: [null as any] });
+  const { pi } = await loadExtension(tmp, { extraSecrets: [null as any] });
   assert.ok(pi.handlers.has("before_provider_request"));
+});
+
+test("extension: .env rotation keeps masking history (seen source)", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "OLD=oldsecretvalue123456\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+
+  // First request: OLD appears in history and gets masked (gets "seen").
+  const p1: any = { model: "x", messages: [{ role: "user", content: "oldsecretvalue123456" }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
+  assert.ok(JSON.stringify(p1).includes("__SECRET_OLD__"), "first request masked");
+
+  // Rotate .env: OLD removed, NEW added.
+  writeFileSync(join(tmp, ".env"), "NEW=brandnewsecretvalue789\n");
+  // Sleep so mtime changes (some filesystems have coarse timestamps).
+  await new Promise((r) => setTimeout(r, 20));
+  const p2: any = { model: "x", messages: [{ role: "user", content: "oldsecretvalue123456" }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p2 }, { cwd: tmp });
+  const t2 = JSON.stringify(p2);
+  assert.equal(t2.includes("oldsecretvalue123456"), false, "rotated-away secret still masked in history");
+  assert.ok(t2.includes("__SECRET_OLD__"), "old placeholder retained");
+});
+
+test("extension: structural fields survive when .env value collides with role", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  // .env value "user" would collide with the message role field.
+  writeFileSync(join(tmp, ".env"), "ROLE=user\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+  const payload: any = { model: "x", messages: [{ role: "user", content: "hello user" }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload }, { cwd: tmp });
+  assert.equal(payload.messages[0].role, "user", "role field untouched");
+  assert.equal(payload.messages[0].content, "hello __SECRET_ROLE__", "text content masked");
+});
+
+test("extension: provider free-text paths masked (tool_result/function_call_output)", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=freetextsecretvalue123\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+
+  // Anthropic: tool_result with content string
+  const p1: any = { model: "x", messages: [{ role: "user", content: [{ type: "tool_result", content: "freetextsecretvalue123" }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
+  assert.ok(JSON.stringify(p1).includes("__SECRET_K__"), "tool_result content masked");
+
+  // OpenAI Responses: function_call_output.output
+  const p2: any = { model: "x", input: [{ type: "function_call_output", call_id: "1", output: "freetextsecretvalue123" }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p2 }, { cwd: tmp });
+  assert.ok(JSON.stringify(p2).includes("__SECRET_K__"), "function_call_output masked");
+  assert.equal(p2.input[0].call_id, "1", "structural call_id untouched");
+});
+
+test("extension: fail-closed aborts on masking error", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=somevalue123456789\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+  let aborted = 0;
+  const ctx = {
+    cwd: tmp,
+    abort: () => { aborted++; },
+  };
+  // Force an error inside the handler: a payload with a getter that throws.
+  const evil: any = {};
+  Object.defineProperty(evil, "messages", {
+    enumerable: true,
+    get() { throw new Error("boom"); },
+  });
+  for (const h of handlers) await h({ type: "before_provider_request", payload: evil }, ctx);
+  assert.equal(aborted, 1, "abort called on masking failure");
 });
