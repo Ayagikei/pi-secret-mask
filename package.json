@@ -1,0 +1,11 @@
+{
+  "name": "pi-secret-mask",
+  "version": "0.1.0",
+  "description": "Mask secrets in pi coding agent conversations: placeholders to the provider, real values to bash, output masked back",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "license": "MIT"
+}

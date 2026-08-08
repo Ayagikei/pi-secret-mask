@@ -1,0 +1,8 @@
+{
+  "mode": "ask",
+  "allowCommands": [],
+  "dotenv": { "enabled": true, "files": [".env", ".env.local", ".env.production", ".env.development"], "exclude": [".env.example", ".env.sample"] },
+  "patterns": { "openai": true, "github": true, "google": true, "aws": true, "jwt": true, "pem": true, "base64": false },
+  "extraSecrets": [],
+  "customPatterns": []
+}
