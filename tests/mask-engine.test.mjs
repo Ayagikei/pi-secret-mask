@@ -170,3 +170,35 @@ test("registerSources + pruneSecrets: 增量更新与清理", () => {
   assert.equal(m.has("b"), false);
   assert.equal(m.has("c"), true);
 });
+
+test("MaskMap: 占位符自身不重复注册（防双重掩码）", () => {
+  const m = new MaskMap();
+  m.add("sk-real-1234567890abcdef", "OPENAI_API_KEY");
+  // .env 里写回了占位符 → 不应注册为新 secret
+  const ph = m.placeholderFor("sk-real-1234567890abcdef");
+  if (ph) m.add(ph, "OPENAI_API_KEY");
+  assert.equal(m.placeholderFor("sk-real-1234567890abcdef"), "__SECRET_OPENAI_API_KEY__");
+  // 无 _2 变体
+  assert.equal(m.has("__SECRET_OPENAI_API_KEY__"), false);
+  assert.equal(m.placeholders().length, 1);
+});
+
+
+test("MaskMap: 短值也参与掩码（全部走掩码策略）", () => {
+  const m = new MaskMap();
+  m.add("1", "TEST");
+  const masked = m.mask("TEST=1");
+  assert.equal(masked, "TEST=__SECRET_TEST__");
+  assert.equal(m.unmask(masked), "TEST=1");
+});
+
+test("maskDeep: write/edit 内容还原（占位符 → 真实值）", () => {
+  const m = new MaskMap();
+  m.add("sk-real-1234567890abcdef", "OPENAI_API_KEY");
+  const input = {
+    path: "/tmp/.env",
+    content: "OPENAI_API_KEY=__SECRET_OPENAI_API_KEY__\nTEST=1",
+  };
+  m.unmaskDeep(input);
+  assert.equal(input.content, "OPENAI_API_KEY=sk-real-1234567890abcdef\nTEST=1");
+});

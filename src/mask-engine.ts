@@ -145,6 +145,9 @@ export function collectPatternSecrets(patterns: { name: string; re: RegExp }[], 
   }));
 }
 
+/** 占位符自身形态（防已掩码内容被重新收集） */
+const PLACEHOLDER_RE = /^__SECRET_[A-Za-z0-9_]+(__\d+)?__$/;
+
 /** 掩码映射：维护 secret ↔ 占位符。 */
 export class MaskMap {
   private secretToPlaceholder = new Map<string, string>();
@@ -157,6 +160,7 @@ export class MaskMap {
   add(secret: string, baseName: string): string {
     const existing = this.secretToPlaceholder.get(secret);
     if (existing) return existing;
+    if (PLACEHOLDER_RE.test(secret)) return secret; // 占位符自身不再注册
     const n = (this.nameCounts.get(baseName) ?? 0) + 1;
     this.nameCounts.set(baseName, n);
     const placeholder = n === 1 ? `__SECRET_${baseName}__` : `__SECRET_${baseName}_${n}__`;

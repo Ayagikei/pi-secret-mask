@@ -34,14 +34,18 @@ interface Config {
 }
 
 const CONFIG_FILE = join(dirname(fileURLToPath(import.meta.url)), "config.json");
+/** npm 安装后优先读用户配置目录（pi update 不会覆盖） */
+const USER_CONFIG_FILE = join(homedir(), ".pi/agent/extensions/pi-secret-mask/config.json");
 
 function loadConfig(): Config {
-  try {
-    if (existsSync(CONFIG_FILE)) {
-      return JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as Config;
+  for (const path of [USER_CONFIG_FILE, CONFIG_FILE]) {
+    try {
+      if (existsSync(path)) {
+        return JSON.parse(readFileSync(path, "utf-8")) as Config;
+      }
+    } catch {
+      // 配置损坏时尝试下一个
     }
-  } catch {
-    // 配置损坏时回退默认
   }
   return {};
 }
@@ -131,24 +135,32 @@ export default function (pi: any) {
   });
 
   pi.on("tool_call", async (event: any, ctx: any) => {
-    if (event.toolName !== "bash") return;
-    const command: string = event.input?.command ?? "";
-    if (!command || !map.placeholders().some((ph) => command.includes(ph))) return;
+    // 先判断是否有占位符（bash 命令 / write 内容 / edit 文本都可能含占位符）
+    const inputStr = JSON.stringify(event.input ?? {});
+    if (!map.placeholders().some((ph) => inputStr.includes(ph))) return;
 
-    if (mode === "ask") {
-      const allowed = allowCommands.some((pat) => command.startsWith(pat) || new RegExp(pat).test(command));
-      if (!allowed) {
-        const ok = ctx?.ui?.confirm
-          ? await ctx.ui.confirm("Secret mask", `命令包含 secret 占位符，是否用真实值执行？\n\n${command}\n\n（对话框只显示占位符，不显示真实值）`)
-          : false;
-        if (!ok) {
-          ctx?.ui?.notify?.(`已阻止命令执行（含 secret 占位符）：${command.slice(0, 120)}`, "warning");
-          return { block: true, reason: "Blocked by secret-mask: 需要真实 secret 执行" };
+    if (event.toolName === "bash") {
+      const command: string = event.input?.command ?? "";
+      if (mode === "ask") {
+        const allowed = allowCommands.some((pat) => command.startsWith(pat) || new RegExp(pat).test(command));
+        if (!allowed) {
+          const ok = ctx?.ui?.confirm
+            ? await ctx.ui.confirm("Secret mask", `命令包含 secret 占位符，是否用真实值执行？\n\n${command}\n\n（对话框只显示占位符，不显示真实值）`)
+            : false;
+          if (!ok) {
+            ctx?.ui?.notify?.(`已阻止命令执行（含 secret 占位符）：${command.slice(0, 120)}`, "warning");
+            return { block: true, reason: "Blocked by secret-mask: 需要真实 secret 执行" };
+          }
         }
       }
+      event.input.command = map.unmask(command);
+      return;
     }
 
-    event.input.command = map.unmask(command);
+    // write/edit：把内容里的占位符换回真实值（agent 把掩码后的值写回文件时存真值）
+    if (event.toolName === "write" || event.toolName === "edit") {
+      maskDeep(event.input, (s) => map.unmask(s));
+    }
   });
 
   pi.on("tool_result", (event: any) => {

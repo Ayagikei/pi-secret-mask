@@ -1,11 +1,25 @@
 {
   "name": "pi-secret-mask",
   "version": "0.1.0",
-  "description": "Mask secrets in pi coding agent conversations: placeholders to the provider, real values to bash, output masked back",
+  "description": "Mask secrets before they reach LLM providers: placeholders in provider payload, real values in bash/write, output masked back",
   "type": "module",
-  "main": "src/index.ts",
-  "scripts": {
-    "test": "node --test tests/"
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "extension", "secret", "mask", "security", "redaction"],
+  "license": "MIT",
+  "author": "Ayagikei",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ayagikei/pi-secret-mask.git"
   },
-  "license": "MIT"
+  "files": ["extensions/", "src/", "config.example.json", "README.md"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\""
+  }
 }
