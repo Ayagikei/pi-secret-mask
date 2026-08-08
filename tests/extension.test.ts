@@ -457,3 +457,57 @@ test("extension: tree masks branch_summary and compaction entry summaries", asyn
   assert.equal(event.preparation.entriesToSummarize[2].message.command, `echo __SECRET_K__`, "message bashExecution.command masked");
   assert.equal(event.preparation.entriesToSummarize[2].message.output, "__SECRET_K__", "message bashExecution.output masked");
 });
+
+test("extension: tool-call arguments and reasoning fields masked", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=toolreason_secret123456\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+  const secret = "toolreason_secret123456";
+  // Prime the map.
+  await handlers[0]({ type: "before_provider_request", payload: { model: "x", messages: [] } }, { cwd: tmp });
+
+  // OpenAI Chat / Mistral: tool_calls[].function.arguments (P0-8/9)
+  const p1: any = { model: "x", messages: [{ role: "assistant", content: null, tool_calls: [{ id: "t1", type: "function", function: { name: "f", arguments: `{"key":"${secret}"}` } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
+  assert.ok(JSON.stringify(p1).includes("__SECRET_K__"), "tool_calls arguments masked");
+  assert.equal(JSON.stringify(p1).includes(secret), false, "no plaintext in tool_calls arguments");
+
+  // Anthropic: tool_use.input (P0-10)
+  const p2: any = { model: "x", messages: [{ role: "assistant", content: [{ type: "tool_use", id: "t2", name: "f", input: { key: secret } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p2 }, { cwd: tmp });
+  assert.equal(p2.messages[0].content[0].input.key, "__SECRET_K__", "tool_use.input masked");
+  assert.equal(p2.messages[0].content[0].id, "t2", "structural id untouched");
+
+  // Gemini: functionCall.args (P0-11)
+  const p3: any = { model: "x", contents: [{ role: "model", parts: [{ functionCall: { name: "f", args: { key: secret } } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p3 }, { cwd: tmp });
+  assert.equal(p3.contents[0].parts[0].functionCall.args.key, "__SECRET_K__", "functionCall.args masked");
+
+  // Bedrock: toolUse.input (P0-12)
+  const p4: any = { model: "x", messages: [{ role: "assistant", content: [{ toolUse: { toolUseId: "t4", name: "f", input: { key: secret } } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p4 }, { cwd: tmp });
+  assert.equal(p4.messages[0].content[0].toolUse.input.key, "__SECRET_K__", "toolUse.input masked");
+
+  // OpenAI Responses: custom_tool_call.input + reasoning item (P0-13/17)
+  const p5: any = { model: "x", input: [{ type: "custom_tool_call", id: "c5", input: secret }, { type: "reasoning", id: "r5", summary: [{ type: "summary_text", text: secret }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p5 }, { cwd: tmp });
+  assert.equal(p5.input[0].input, "__SECRET_K__", "custom_tool_call.input masked");
+  assert.equal(p5.input[1].summary[0].text, "__SECRET_K__", "reasoning summary text masked");
+
+  // OpenAI Chat reasoning_content (P0-14)
+  const p6: any = { model: "x", messages: [{ role: "assistant", content: "ok", reasoning_content: `think ${secret}` }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p6 }, { cwd: tmp });
+  assert.equal(p6.messages[0].reasoning_content, "think __SECRET_K__", "reasoning_content masked");
+
+  // Anthropic thinking block + Bedrock reasoningText (P0-15/16)
+  const p7: any = { model: "x", messages: [{ role: "assistant", content: [{ type: "thinking", thinking: `think ${secret}`, signature: "sig" }, { type: "text", text: "ok" }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p7 }, { cwd: tmp });
+  assert.equal(p7.messages[0].content[0].thinking, "think __SECRET_K__", "anthropic thinking masked");
+  assert.equal(p7.messages[0].content[0].signature, "sig", "signature untouched (documented tradeoff)");
+
+  const p8: any = { model: "x", messages: [{ role: "assistant", content: [{ reasoningContent: { reasoningText: { text: `think ${secret}` } }, text: "ok" }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p8 }, { cwd: tmp });
+  assert.equal(p8.messages[0].content[0].reasoningContent.reasoningText.text, "think __SECRET_K__", "bedrock reasoningText masked");
+});

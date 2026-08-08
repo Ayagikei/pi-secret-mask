@@ -300,8 +300,39 @@ export default function (pi: any) {
       if (m.role === "bashExecution") {
         if (typeof m.command === "string") m.command = maskText(m.command);
         if (typeof m.output === "string") m.output = maskText(m.output);
+        if (typeof m.fullOutputPath === "string") m.fullOutputPath = maskText(m.fullOutputPath);
       } else if (m.role === "branchSummary" || m.role === "compactionSummary") {
         if (typeof m.summary === "string") m.summary = maskText(m.summary);
+      }
+      // Provider tool-call arguments (P0-8/9/13): OpenAI Chat / Mistral
+      // messages[].tool_calls[].function.arguments, Responses custom_tool_call.input.
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          if (tc?.function && typeof tc.function.arguments === "string") {
+            tc.function.arguments = maskText(tc.function.arguments);
+          }
+        }
+      }
+      if (m.type === "custom_tool_call" && typeof m.input === "string") {
+        m.input = maskText(m.input);
+      }
+      // Reasoning fields (P0-14/17): OpenAI Chat reasoning_content/reasoning,
+      // Responses reasoning item summary[].text / content[].text.
+      if (typeof m.reasoning_content === "string") m.reasoning_content = maskText(m.reasoning_content);
+      if (typeof m.reasoning === "string") m.reasoning = maskText(m.reasoning);
+      if (typeof m.reasoning_text === "string") m.reasoning_text = maskText(m.reasoning_text);
+      if (m.type === "reasoning") {
+        if (Array.isArray(m.summary)) {
+          for (const s of m.summary) {
+            if (s && typeof s === "object" && typeof s.text === "string") s.text = maskText(s.text);
+            else if (typeof s === "string") m.summary[m.summary.indexOf(s)] = maskText(s);
+          }
+        }
+        if (Array.isArray(m.content)) {
+          for (const c of m.content) {
+            if (c && typeof c === "object" && typeof c.text === "string") c.text = maskText(c.text);
+          }
+        }
       }
     }
   }
@@ -414,6 +445,26 @@ export default function (pi: any) {
       }
       if (block.toolResult && typeof block.toolResult === "object" && Array.isArray(block.toolResult.content)) {
         maskBlocks(block.toolResult.content);
+      }
+      // Tool-use input payloads are free-form JSON that may embed secrets
+      // (P0-10/11/12): Anthropic tool_use.input, Gemini functionCall.args,
+      // Bedrock toolUse.input.
+      if (block.type === "tool_use" && block.input && typeof block.input === "object") {
+        maskDeep(block.input, (s) => maskText(s));
+      }
+      if (block.functionCall && typeof block.functionCall === "object" && block.functionCall.args && typeof block.functionCall.args === "object") {
+        maskDeep(block.functionCall.args, (s) => maskText(s));
+      }
+      if (block.toolUse && typeof block.toolUse === "object" && block.toolUse.input && typeof block.toolUse.input === "object") {
+        maskDeep(block.toolUse.input, (s) => maskText(s));
+      }
+      // Reasoning content (P0-15/16): Anthropic thinking, Bedrock reasoningText.
+      if (block.type === "thinking" && typeof block.thinking === "string") {
+        block.thinking = maskText(block.thinking);
+      }
+      if (block.reasoningContent && typeof block.reasoningContent === "object") {
+        const rt = block.reasoningContent.reasoningText;
+        if (rt && typeof rt === "object" && typeof rt.text === "string") rt.text = maskText(rt.text);
       }
       // Other block types are skipped: their string fields are structural.
     }
