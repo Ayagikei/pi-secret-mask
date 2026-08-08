@@ -24,11 +24,19 @@ where secrets never enter provider requests or leak back through tool output.
 
 ## Installation
 
-Copy `src/` and `extensions/` plus a `config.json` into an extension dir:
+Install from npm (recommended):
+
+```bash
+pi install npm:pi-secret-mask
+```
+
+Manual copy (keep the `extensions/` + `src/` layout — the entry imports
+`../src/mask-engine.ts`):
 
 ```bash
 mkdir -p ~/.pi/agent/extensions/pi-secret-mask
-cp src/mask-engine.ts extensions/pi-secret-mask.ts ~/.pi/agent/extensions/pi-secret-mask/
+cp -R src ~/.pi/agent/extensions/pi-secret-mask/
+cp extensions/pi-secret-mask.ts ~/.pi/agent/extensions/pi-secret-mask/index.ts
 cp config.example.json ~/.pi/agent/extensions/pi-secret-mask/config.json
 ```
 

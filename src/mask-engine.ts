@@ -72,14 +72,14 @@ function builtinPatterns(opts: MaskOptions["patterns"]): { name: string; re: Reg
   add("GITHUB", opts.github, "(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}");
   add("GOOGLE", opts.google, "AIza[0-9A-Za-z_-]{35}");
   add("AWS", opts.aws, "(?:AKIA|ASIA|AIDA)[0-9A-Z]{16}");
-  add("AWS_SK", opts.aws, `"?(?:SecretAccessKey|SessionToken)"?\s*[:=]\s*"?([A-Za-z0-9+/=]{20,})"`);
+  add("AWS_SK", opts.aws, `"?(?:SecretAccessKey|SessionToken)"?\\s*[:=]\\s*"?([A-Za-z0-9+/=]{20,})"`);
   add("JWT", opts.jwt, "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}");
   add("PEM", opts.pem, "-----BEGIN [A-Z ]*PRIVATE KEY-----\\s*[A-Za-z0-9+/=\\s]+?-----END [A-Z ]*PRIVATE KEY-----");
   add("BASE64", opts.base64, `[A-Za-z0-9+/]{${opts.base64MinLength},}={0,2}`);
   return out;
 }
 
-/** Parse .env content into KEY=VALUE pairs. Rules: quote stripping, export prefix, inline comments, CRLF, values may contain =. */
+/** Parse .env content into KEY=VALUE pairs. Rules: quote stripping (with \\-escapes), export prefix, inline comments, CRLF, values may contain =. */
 export function parseDotenv(content: string): { key: string; value: string }[] {
   const out: { key: string; value: string }[] = [];
   for (let rawLine of content.split(/\r?\n/)) {
@@ -91,13 +91,26 @@ export function parseDotenv(content: string): { key: string; value: string }[] {
     if (key.startsWith("export ")) key = key.slice(7).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     let value = line.slice(eq + 1).trim();
-    // Inline comments only apply outside quotes (simplified: values starting with a quote are not comment-stripped).
     const firstQuote = value[0];
     if (firstQuote === '"' || firstQuote === "'") {
-      const closing = value.indexOf(firstQuote, 1);
-      if (closing > 0) value = value.slice(1, closing);
-      // No closing quote: take the whole line.
+      // Quoted value: strip the wrapping quote and honor \\-escapes inside.
+      value = value.slice(1);
+      let end = -1;
+      for (let i = 0; i < value.length; i++) {
+        if (value[i] === "\\" && i + 1 < value.length) {
+          value = value.slice(0, i) + value[i + 1] + value.slice(i + 2);
+          i++; // skip the escaped char
+          continue;
+        }
+        if (value[i] === firstQuote) {
+          end = i;
+          break;
+        }
+      }
+      if (end >= 0) value = value.slice(0, end);
+      // No closing quote: take the whole (already unescaped) remainder.
     } else {
+      // Unquoted: an inline comment starts at " #" (dotenv convention).
       const hash = value.indexOf(" #");
       if (hash >= 0) value = value.slice(0, hash).trim();
     }
@@ -299,6 +312,8 @@ function isImageNode(v: Record<string, unknown>): boolean {
     const s = v.source as Record<string, unknown>;
     if (s.type === "base64" || s.type === "url" || s.type === "bytes") return true;
   }
+  // Google Gemini inlineData blocks carry raw base64 image data.
+  if (typeof v.inlineData === "object" && v.inlineData !== null) return true;
   return false;
 }
 

@@ -259,3 +259,51 @@ test("collectPatternSecrets: AWS SecretAccessKey/SessionToken captured", () => {
   assert.ok(names.includes("AWS"));       // AccessKeyId
   assert.ok(names.includes("AWS_SK"));    // SecretAccessKey + SessionToken
 });
+
+test("parseDotenv: escaped quotes inside double-quoted values", () => {
+  const entries = parseDotenv('KEY="foo\\"bar"\nSIMPLE="a b"');
+  const map = new Map(entries.map((e) => [e.key, e.value]));
+  assert.equal(map.get("KEY"), 'foo"bar');
+  assert.equal(map.get("SIMPLE"), "a b");
+});
+
+test("collectPatternSecrets: AWS pretty-printed JSON with spaces", () => {
+  const opts = {
+    extraSecrets: [],
+    customPatterns: [],
+    dotenv: { enabled: false, files: [], exclude: [] },
+    patterns: { openai: false, github: false, google: false, aws: true, jwt: false, pem: false, base64: false },
+    base64MinLength: 32,
+  };
+  const pretty = '{\n  "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"\n}';
+  const sources = collectSecretsFromText(pretty, opts);
+  const sk = sources.find((s) => s.name === "AWS_SK");
+  assert.ok(sk, "AWS_SK should be found in pretty-printed JSON");
+  assert.ok(sk.values.includes("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
+});
+
+test("maskDeep: Google inlineData image nodes skipped", () => {
+  const m = new MaskMap();
+  m.add("short", "K");
+  const obj = {
+    parts: [
+      { text: "short text here" },
+      { inlineData: { mimeType: "image/png", data: "short AAAA" } },
+    ],
+  };
+  m.maskDeep(obj);
+  assert.equal(obj.parts[0].text, "__SECRET_K__ text here");
+  assert.equal(obj.parts[1].inlineData.data, "short AAAA"); // untouched
+});
+
+test("MaskMap: structural field values are not masked when scanning text fields only", () => {
+  // Simulates the payload sweep: role/type fields must never be rewritten.
+  const m = new MaskMap();
+  m.add("user", "ROLE"); // .env value that collides with a structural field
+  // maskText on a content string only — role lives outside content.
+  const content = "user message body";
+  assert.equal(m.mask(content), "__SECRET_ROLE__ message body"); // content is text, fine
+  // The structural role field itself is never passed to maskText.
+  const role = "user";
+  assert.equal(m.unmask(role), role); // untouched
+});

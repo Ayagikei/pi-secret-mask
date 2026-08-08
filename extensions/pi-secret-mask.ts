@@ -62,12 +62,37 @@ function validateConfig(raw: unknown): Config {
   const out: Config = {};
   if (cfg.mode === "auto" || cfg.mode === "ask") out.mode = cfg.mode;
   else out.mode = "ask"; // invalid mode -> safe default
-  if (Array.isArray(cfg.allowCommands)) out.allowCommands = cfg.allowCommands;
+  if (Array.isArray(cfg.allowCommands)) out.allowCommands = cfg.allowCommands.filter((x) => typeof x === "string");
   else out.allowCommands = [];
-  if (cfg.dotenv && typeof cfg.dotenv === "object") out.dotenv = cfg.dotenv;
-  if (cfg.patterns && typeof cfg.patterns === "object") out.patterns = cfg.patterns;
-  if (Array.isArray(cfg.extraSecrets)) out.extraSecrets = cfg.extraSecrets;
-  if (Array.isArray(cfg.customPatterns)) out.customPatterns = cfg.customPatterns;
+  if (cfg.dotenv && typeof cfg.dotenv === "object") {
+    const d = cfg.dotenv;
+    const nd: NonNullable<Config["dotenv"]> = {};
+    if (typeof d.enabled === "boolean") nd.enabled = d.enabled;
+    if (Array.isArray(d.files)) nd.files = d.files.filter((x) => typeof x === "string");
+    if (Array.isArray(d.exclude)) nd.exclude = d.exclude.filter((x) => typeof x === "string");
+    if (Object.keys(nd).length > 0) out.dotenv = nd;
+  }
+  if (cfg.patterns && typeof cfg.patterns === "object") {
+    const p = cfg.patterns as Record<string, unknown>;
+    const np: NonNullable<Config["patterns"]> = {};
+    for (const key of ["openai", "github", "google", "aws", "jwt", "pem", "base64"] as const) {
+      if (typeof p[key] === "boolean") np[key] = p[key];
+    }
+    if (Object.keys(np).length > 0) out.patterns = np;
+  }
+  if (Array.isArray(cfg.extraSecrets)) {
+    out.extraSecrets = cfg.extraSecrets.filter(
+      (e): e is { name: string; value: string } =>
+        !!e && typeof e === "object" && typeof (e as { name?: unknown }).name === "string" && typeof (e as { value?: unknown }).value === "string",
+    );
+  }
+  if (Array.isArray(cfg.customPatterns)) {
+    out.customPatterns = cfg.customPatterns.filter(
+      (c): c is { name: string; pattern: string; flags?: string } =>
+        !!c && typeof c === "object" && typeof (c as { name?: unknown }).name === "string" && typeof (c as { pattern?: unknown }).pattern === "string" &&
+        ((c as { flags?: unknown }).flags === undefined || typeof (c as { flags?: unknown }).flags === "string"),
+    );
+  }
   if (typeof cfg.base64MinLength === "number" && Number.isFinite(cfg.base64MinLength) && cfg.base64MinLength > 0) {
     out.base64MinLength = cfg.base64MinLength;
   }
@@ -138,9 +163,9 @@ export default function (pi: any) {
 
   function refreshDotenv(baseDir: string): void {
     if (!options.dotenv.enabled) return;
-    let changed = false;
     const files = options.dotenv.files.filter((f) => !options.dotenv.exclude.includes(f));
     const seen = new Set<string>();
+    const changedFiles: string[] = [];
     for (const file of files) {
       const path = join(baseDir, file);
       if (!existsSync(path)) continue;
@@ -151,39 +176,45 @@ export default function (pi: any) {
       } catch {
         continue;
       }
-      if (dotenvMtimes.get(path) === mtime) continue;
-      dotenvMtimes.set(path, mtime);
-      changed = true;
+      if (dotenvMtimes.get(path) !== mtime) changedFiles.push(path);
     }
     // Drop records for files that disappeared.
     for (const [path] of dotenvMtimes) {
       if (!seen.has(path)) {
         dotenvMtimes.delete(path);
-        changed = true;
       }
     }
-    if (!changed) return;
+    if (changedFiles.length === 0) return;
     let entries: Map<string, string>;
     try {
       entries = loadDotenvFiles({ existsSync, readFileSync }, baseDir, options.dotenv);
     } catch {
-      // .env changed but is unreadable: keep using the old mapping and
-      // continue masking (P0-3: never abort the provider hook).
+      // .env changed but is unreadable: keep the old mapping (do NOT commit
+      // mtime, so we retry next request; never abort the provider hook).
       return;
     }
+    // Commit mtimes only after a successful read (P0-3).
+    for (const path of changedFiles) {
+      const mtime = statSync(path, { throwIfNoEntry: false })?.mtimeMs;
+      if (mtime !== undefined) dotenvMtimes.set(path, mtime);
+    }
     // Source-aware prune (P0-4): only remove secrets that came from .env
-    // and are no longer provided; user/extra/regex secrets survive.
+    // and are no longer provided; secrets also present in user/extra survive.
+    const protectedValues = new Set<string>();
+    for (const v of userSecrets.values()) protectedValues.add(v);
+    for (const { value } of options.extraSecrets) if (value) protectedValues.add(value);
     const dotenvOwned = new Map<string, string>(); // value -> key
     for (const [key, value] of entries) {
       dotenvOwned.set(value, key);
     }
-    for (const secret of [...dotenvOwned.keys()]) {
-      if (!map.has(secret)) map.add(secret, dotenvOwned.get(secret)!);
+    for (const [secret, key] of dotenvOwned) {
+      if (!map.has(secret)) map.add(secret, key);
     }
-    // Remove .env secrets that are no longer present (only those tracked as dotenv-sourced).
+    // Remove .env secrets that are no longer present, unless still needed
+    // by another source (user / extraSecrets).
     for (const ph of map.placeholders()) {
       const secret = map.secretFor(ph);
-      if (secret && !dotenvOwned.has(secret) && dotenvSourced.has(secret)) {
+      if (secret && !dotenvOwned.has(secret) && dotenvSourced.has(secret) && !protectedValues.has(secret)) {
         map.remove(secret);
         dotenvSourced.delete(secret);
       }
@@ -213,21 +244,41 @@ export default function (pi: any) {
     return map.mask(text);
   }
 
-  /** Mask any provider payload shape (messages/input/contents/system + string content). */
+  /**
+   * Mask any provider payload shape (messages/input/contents/system + string
+   * content). Only known text paths are scanned: sweeping the whole payload
+   * would corrupt structural fields (role/type/name) when a short .env value
+   * collides with them (P1-N1).
+   */
   function maskPayload(payload: any): void {
     if (payload == null) return;
     // System prompt can be a string (Anthropic/Bedrock) or an array of blocks.
     if (typeof payload.system === "string") {
       payload.system = maskText(payload.system);
-    } else if (payload.system && typeof payload.system === "object") {
-      maskDeep(payload.system, (s) => maskText(s));
+    } else if (Array.isArray(payload.system)) {
+      maskBlocks(payload.system);
     }
     for (const key of ["messages", "input", "contents"]) {
       const list = payload[key];
       if (Array.isArray(list)) maskMessages(list);
     }
-    // Fallback: sweep any remaining text fields (e.g. tool definitions, custom fields).
-    maskDeep(payload, (s) => maskText(s));
+    // Tool definitions carry descriptions that may embed secrets.
+    if (Array.isArray(payload.tools)) {
+      for (const tool of payload.tools) {
+        if (tool?.function?.description) tool.function.description = maskText(tool.function.description);
+      }
+    }
+  }
+
+  /** Mask Anthropic-style content blocks (text only; images skipped by maskDeep). */
+  function maskBlocks(blocks: any[]): void {
+    for (const block of blocks) {
+      if (block && typeof block === "object" && typeof block.text === "string") {
+        block.text = maskText(block.text);
+      } else if (block && typeof block === "object") {
+        maskDeep(block, (s) => maskText(s));
+      }
+    }
   }
 
   pi.on("before_provider_request", (event: any, ctx: any) => {
@@ -237,11 +288,11 @@ export default function (pi: any) {
       maskPayload(payload);
       return payload;
     } catch (err) {
-      // Fail-closed on masking errors: replace payload with a refused call
-      // rather than letting unmasked secrets go out (P0-3).
-      return {
-        error: `pi-secret-mask failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
+      // Fail-closed: abort the request rather than letting unmasked secrets
+      // go out. (before_provider_request cannot "reject" — any non-undefined
+      // return replaces the payload, so abort the whole turn.)
+      ctx?.abort?.();
+      return undefined;
     }
   });
 
@@ -252,13 +303,15 @@ export default function (pi: any) {
 
     if (event.toolName === "bash") {
       const command: string = event.input?.command ?? "";
-      // P0-6: refuse secrets whose real value would break shell semantics
-      // (quotes, newlines, $(), backticks, whitespace). Check the secret
-      // values themselves, not the whole command.
+      // P0-6: refuse secrets whose real value contains any shell metacharacter.
+      // Strict whitelist: alnum + a few safe punctuation. Anything else
+      // (quotes, whitespace, $, backticks, ;, |, &, >, <, (, ), #, ...) is
+      // rejected rather than inlined into shell syntax.
+      const SAFE_SECRET_RE = /^[A-Za-z0-9._:\/@+=%-]+$/;
       for (const ph of map.placeholders()) {
         if (!command.includes(ph)) continue;
         const secret = map.secretFor(ph) ?? "";
-        if (/[\n\r'"\\`$\s]/.test(secret)) {
+        if (!SAFE_SECRET_RE.test(secret)) {
           ctx?.ui?.notify?.(`Blocked: secret ${ph} contains shell-special characters that would change command semantics`, "warning");
           return { block: true, reason: "Blocked by secret-mask: secret value is not safe to inline into a shell command" };
         }
