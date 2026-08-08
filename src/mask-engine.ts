@@ -124,11 +124,12 @@ export function parseDotenv(content: string): { key: string; value: string }[] {
 }
 
 /**
- * Read .env* files from disk (later files override earlier keys).
+ * Read .env paths from disk (later files override earlier keys).
  *
  * The caller passes the exact paths it saw during scanning; every path is
  * read unconditionally (no existsSync pre-check), so a file that vanishes
  * between scan and read throws and aborts the whole refresh (P0-3 TOCTOU).
+ * Exclude filtering is the caller's responsibility (P1-1: no suffix guessing).
  */
 export function loadDotenvPaths(fs: {
   readFileSync: (p: string) => string;
@@ -136,7 +137,6 @@ export function loadDotenvPaths(fs: {
   const result = new Map<string, string>();
   if (!opts.enabled) return result;
   for (const path of paths) {
-    if (opts.exclude.some((f) => path.endsWith(`/${f}`) || path.endsWith(f))) continue;
     const content = fs.readFileSync(path); // throws if it vanished -> abort refresh
     for (const { key, value } of parseDotenv(typeof content === "string" ? content : String(content))) {
       result.set(key, value);

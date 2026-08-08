@@ -509,15 +509,18 @@ export default function (pi: any) {
   });
 
   pi.on("session_before_compact", (event: any, ctx: any) => {
-    const prep = event.preparation;
+    const prep = event?.preparation;
     if (!prep) return;
     try {
       refreshDotenv(ctx?.cwd ?? process.cwd());
       if (Array.isArray(prep.messagesToSummarize)) maskMessages(prep.messagesToSummarize);
       if (Array.isArray(prep.turnPrefixMessages)) maskMessages(prep.turnPrefixMessages);
-      // Provider-bound custom instructions may embed secrets (P0-N6).
-      if (typeof prep.customInstructions === "string") {
-        prep.customInstructions = maskText(prep.customInstructions);
+      // Provider-bound custom instructions may embed secrets (P0-N6). Pi
+      // passes them at event level and the compaction result type offers no
+      // instructions override, so if instructions contain a secret we must
+      // fail closed by cancelling compaction rather than leak them.
+      if (typeof event.customInstructions === "string" && map.mask(event.customInstructions) !== event.customInstructions) {
+        return { cancel: true };
       }
     } catch {
       // Never abort compaction.
@@ -525,15 +528,18 @@ export default function (pi: any) {
   });
 
   pi.on("session_before_tree", (event: any, ctx: any) => {
-    const prep = event.preparation;
+    const prep = event?.preparation;
     if (!prep) return;
     try {
       refreshDotenv(ctx?.cwd ?? process.cwd());
       if (Array.isArray(prep.entriesToSummarize)) {
         for (const entry of prep.entriesToSummarize) {
-          // Both message entries and custom_message entries feed branch
-          // summaries (P0-N5).
-          const msg = entry?.message ?? entry?.custom_message;
+          if (!entry) continue;
+          // Real Pi structures (P0-N5): message entries carry .message.content;
+          // custom_message entries carry top-level .content.
+          let msg: any = null;
+          if (entry.type === "custom_message") msg = entry;
+          else msg = entry.message ?? entry.custom_message;
           if (msg?.content) {
             if (typeof msg.content === "string") {
               msg.content = maskText(msg.content);
@@ -545,9 +551,12 @@ export default function (pi: any) {
           }
         }
       }
-      // Provider-bound custom instructions may embed secrets (P0-N6).
+      // P0-N6: Pi only honors the returned override, not preparation mutation.
       if (typeof prep.customInstructions === "string") {
-        prep.customInstructions = maskText(prep.customInstructions);
+        const masked = maskText(prep.customInstructions);
+        if (masked !== prep.customInstructions) {
+          return { customInstructions: masked };
+        }
       }
     } catch {
       // Never abort tree navigation.

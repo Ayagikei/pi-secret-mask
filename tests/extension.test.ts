@@ -308,17 +308,23 @@ test("extension: tree hook masks custom_message and customInstructions", async (
     type: "session_before_tree",
     preparation: {
       entriesToSummarize: [
-        { type: "message", message: { role: "user", content: `msg ${secret}` } },
-        { type: "custom_message", custom_message: { role: "user", content: `custom ${secret}` } },
+        { type: "message", id: "m1", message: { role: "user", content: `msg ${secret}` } },
+        // Real Pi structure: custom_message carries top-level content (P0-N5).
+        { type: "custom_message", id: "c1", customType: "test", display: true, content: `custom ${secret}` },
       ],
       customInstructions: `instr ${secret}`,
     },
     signal: undefined,
   };
-  for (const h of treeHandlers) await h(event, { cwd: tmp });
+  let result: any;
+  for (const h of treeHandlers) {
+    const r = await h(event, { cwd: tmp });
+    if (r !== undefined) result = r;
+  }
   assert.equal(event.preparation.entriesToSummarize[0].message.content, "msg __SECRET_K__", "message entry masked");
-  assert.equal(event.preparation.entriesToSummarize[1].custom_message.content, "custom __SECRET_K__", "custom_message masked");
-  assert.equal(event.preparation.customInstructions, "instr __SECRET_K__", "customInstructions masked");
+  assert.equal(event.preparation.entriesToSummarize[1].content, "custom __SECRET_K__", "custom_message top-level content masked");
+  // Pi only honors the returned override (P0-N6).
+  assert.equal(result?.customInstructions, "instr __SECRET_K__", "customInstructions returned as override");
 });
 
 test("extension: .env vanishing between scan and read aborts refresh (TOCTOU)", async (t) => {
@@ -341,4 +347,37 @@ test("extension: .env vanishing between scan and read aborts refresh (TOCTOU)", 
   const p1: any = { model: "x", messages: [{ role: "user", content: "oldvaluetooctou12345" }] };
   for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
   assert.equal(JSON.stringify(p1).includes("oldvaluetooctou12345"), false, "old value stays masked after file removal");
+});
+
+
+test("extension: compact hook cancels when customInstructions contain secrets", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=compact_instr_secret12345\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const compactHandlers = pi.handlers.get("session_before_compact")!;
+  const secret = "compact_instr_secret12345";
+
+  // Prime the map.
+  const bpHandlers = pi.handlers.get("before_provider_request")!;
+  const p0: any = { model: "x", messages: [] };
+  for (const h of bpHandlers) await h({ type: "before_provider_request", payload: p0 }, { cwd: tmp });
+
+  // Safe instructions: no secret -> no cancel.
+  let event: any = { type: "session_before_compact", preparation: { messagesToSummarize: [], turnPrefixMessages: [] }, customInstructions: "safe focus" };
+  let result: any;
+  for (const h of compactHandlers) {
+    const r = await h(event, { cwd: tmp });
+    if (r !== undefined) result = r;
+  }
+  assert.equal(result?.cancel, undefined, "safe instructions do not cancel");
+
+  // Instructions containing a secret -> cancel (fail closed, P0-N6).
+  event = { type: "session_before_compact", preparation: { messagesToSummarize: [], turnPrefixMessages: [] }, customInstructions: `focus on ${secret}` };
+  result = undefined;
+  for (const h of compactHandlers) {
+    const r = await h(event, { cwd: tmp });
+    if (r !== undefined) result = r;
+  }
+  assert.equal(result?.cancel, true, "secret-bearing instructions cancel compaction");
 });
