@@ -1,5 +1,7 @@
 # pi-secret-mask
 
+[简体中文](README.zh-CN.md)
+
 Prevent project secrets (API keys, tokens, private keys) from being sent to
 LLM providers.
 
@@ -117,7 +119,7 @@ non-text (image) content.
 }
 ```
 
-## Boundaries
+## Boundaries & Disclaimer
 
 - Goal is preventing secrets from leaking to providers, **not sandboxing**:
   the model can still read/write files locally (e.g. `echo $KEY > /tmp/x`
@@ -128,6 +130,23 @@ non-text (image) content.
 - Image content (screenshots) may contain real values and cannot be masked.
 - Real values are restored locally into bash command lines (`ps`-visible,
   shell history) — visible only locally, never sent to the provider.
+- **Reasoning/thinking blocks**: if a secret somehow appears inside a model's
+  reasoning or thinking content, the extension masks the text but the
+  signature (e.g. Anthropic `signature`, Bedrock reasoning signatures) is
+  left stale. Some providers reject such requests — this is an intentional
+  fail-closed trade-off: leaking is worse than a refused request. In
+  practice this is rare because secrets never reach the model in the first
+  place.
+- **Detection is pattern-based, not perfect**: unknown secret formats are
+  only caught if they match a built-in or custom pattern, or appear in
+  `.env*` / were registered manually. A secret in an unrecognized format can
+  pass through.
+- This extension is defense-in-depth, **not a security boundary**. It runs
+  with your user's permissions and cannot protect against malicious prompts,
+  hostile repositories, or local exfiltration. Review extension source
+  before installing, and use OS-level sandboxing for untrusted work.
+- This software is provided "as is", without warranty of any kind. The
+  authors are not liable for any damages arising from its use or misuse.
 
 ## Development
 
