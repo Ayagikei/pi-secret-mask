@@ -30,18 +30,18 @@ Install from npm (recommended):
 pi install npm:pi-secret-mask
 ```
 
-Manual copy (keep the `extensions/` + `src/` layout — the entry imports
-`../src/mask-engine.ts`):
+Manual install — clone the repo and point pi at its `extensions/` directory
+(keeps the layout so the entry's `../src` import resolves):
 
 ```bash
-mkdir -p ~/.pi/agent/extensions/pi-secret-mask
-cp -R src ~/.pi/agent/extensions/pi-secret-mask/
-cp extensions/pi-secret-mask.ts ~/.pi/agent/extensions/pi-secret-mask/index.ts
+git clone https://github.com/Ayagikei/pi-secret-mask ~/.pi/agent/extensions/pi-secret-mask
+# then add to ~/.pi/agent/settings.json:
+#   "extensions": ["~/.pi/agent/extensions/pi-secret-mask/extensions"]
 cp config.example.json ~/.pi/agent/extensions/pi-secret-mask/config.json
 ```
 
-(Project-local: put it in `.pi/extensions/pi-secret-mask/` to scope it to one
-project.)
+(Project-local: point to a repo clone inside `.pi/extensions/` to scope it to
+one project.)
 
 Then `/reload` or restart pi.
 

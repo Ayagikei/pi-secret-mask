@@ -95,20 +95,24 @@ export function parseDotenv(content: string): { key: string; value: string }[] {
     if (firstQuote === '"' || firstQuote === "'") {
       // Quoted value: strip the wrapping quote and honor \\-escapes inside.
       value = value.slice(1);
+      let out = "";
       let end = -1;
-      for (let i = 0; i < value.length; i++) {
-        if (value[i] === "\\" && i + 1 < value.length) {
-          value = value.slice(0, i) + value[i + 1] + value.slice(i + 2);
-          i++; // skip the escaped char
+      let i = 0;
+      while (i < value.length) {
+        const ch = value[i];
+        if (ch === "\\" && i + 1 < value.length) {
+          out += value[i + 1];
+          i += 2;
           continue;
         }
-        if (value[i] === firstQuote) {
+        if (ch === firstQuote) {
           end = i;
           break;
         }
+        out += ch;
+        i++;
       }
-      if (end >= 0) value = value.slice(0, end);
-      // No closing quote: take the whole (already unescaped) remainder.
+      value = out; // escaped, comment-free remainder
     } else {
       // Unquoted: an inline comment starts at " #" (dotenv convention).
       const hash = value.indexOf(" #");

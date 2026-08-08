@@ -307,3 +307,11 @@ test("MaskMap: structural field values are not masked when scanning text fields 
   const role = "user";
   assert.equal(m.unmask(role), role); // untouched
 });
+
+test("parseDotenv: escaped quote right before closing quote (off-by-one)", () => {
+  // A="x\q" — backslash escape immediately followed by the closing quote
+  // must not swallow the quote.
+  const entries = parseDotenv('A="x\\q"');
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].value, "xq"); // escaped q, closing quote consumed
+});

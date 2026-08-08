@@ -118,14 +118,17 @@ export default function (pi: any) {
 
   const map = new MaskMap();
   let dotenvMtimes = new Map<string, number>();
-  // Secrets whose source is .env (only these are pruned when .env changes).
-  const dotenvSourced = new Set<string>();
+  /** Tracks every source that contributed each secret: "dotenv" | "user" | "extra" | "regex:<name>". */
+  const secretSources = new Map<string, Set<string>>();
   // Secrets registered via /mask-secret (only these are persisted).
   const userSecrets = new Map<string, string>(); // name -> value
 
   // Extra secrets from config.
   for (const { name, value } of options.extraSecrets) {
-    if (value) map.add(value, name);
+    if (value) {
+      map.add(value, name);
+      addSource(value, "extra");
+    }
   }
 
   // Load persisted user secrets.
@@ -137,6 +140,7 @@ export default function (pi: any) {
           if (value) {
             userSecrets.set(name, value);
             map.add(value, name);
+            addSource(value, "user");
           }
         }
       }
@@ -161,11 +165,32 @@ export default function (pi: any) {
     }
   }
 
+  /** Record that a secret comes from an additional source. */
+  function addSource(secret: string, source: string): void {
+    let set = secretSources.get(secret);
+    if (!set) {
+      set = new Set();
+      secretSources.set(secret, set);
+    }
+    set.add(source);
+  }
+
+  /** Drop one source; remove the secret from the map when no sources remain. */
+  function dropSource(secret: string, source: string): void {
+    const set = secretSources.get(secret);
+    if (!set) return;
+    set.delete(source);
+    if (set.size === 0) {
+      secretSources.delete(secret);
+      map.remove(secret);
+    }
+  }
+
   function refreshDotenv(baseDir: string): void {
     if (!options.dotenv.enabled) return;
     const files = options.dotenv.files.filter((f) => !options.dotenv.exclude.includes(f));
     const seen = new Set<string>();
-    const changedFiles: string[] = [];
+    const scanned = new Map<string, number>(); // path -> mtime observed this pass
     for (const file of files) {
       const path = join(baseDir, file);
       if (!existsSync(path)) continue;
@@ -176,15 +201,20 @@ export default function (pi: any) {
       } catch {
         continue;
       }
-      if (dotenvMtimes.get(path) !== mtime) changedFiles.push(path);
+      scanned.set(path, mtime);
     }
-    // Drop records for files that disappeared.
-    for (const [path] of dotenvMtimes) {
+    // A file that disappeared is a change: drop its record so it reloads when back.
+    let changed = false;
+    for (const [path, mtime] of dotenvMtimes) {
       if (!seen.has(path)) {
         dotenvMtimes.delete(path);
+        changed = true;
       }
     }
-    if (changedFiles.length === 0) return;
+    for (const [path, mtime] of scanned) {
+      if (dotenvMtimes.get(path) !== mtime) changed = true;
+    }
+    if (!changed) return;
     let entries: Map<string, string>;
     try {
       entries = loadDotenvFiles({ existsSync, readFileSync }, baseDir, options.dotenv);
@@ -193,54 +223,58 @@ export default function (pi: any) {
       // mtime, so we retry next request; never abort the provider hook).
       return;
     }
-    // Commit mtimes only after a successful read (P0-3).
-    for (const path of changedFiles) {
-      const mtime = statSync(path, { throwIfNoEntry: false })?.mtimeMs;
-      if (mtime !== undefined) dotenvMtimes.set(path, mtime);
+    // Commit the mtimes we observed during scanning (not a fresh stat, which
+    // could race a concurrent write — P0-3).
+    for (const [path, mtime] of scanned) {
+      dotenvMtimes.set(path, mtime);
     }
-    // Source-aware prune (P0-4): only remove secrets that came from .env
-    // and are no longer provided; secrets also present in user/extra survive.
-    const protectedValues = new Set<string>();
-    for (const v of userSecrets.values()) protectedValues.add(v);
-    for (const { value } of options.extraSecrets) if (value) protectedValues.add(value);
-    const dotenvOwned = new Map<string, string>(); // value -> key
+    // Add new .env secrets; drop .env source from secrets that are no longer
+    // provided. Secrets with other remaining sources (user/extra/regex) stay.
     for (const [key, value] of entries) {
-      dotenvOwned.set(value, key);
-    }
-    for (const [secret, key] of dotenvOwned) {
-      if (!map.has(secret)) map.add(secret, key);
-    }
-    // Remove .env secrets that are no longer present, unless still needed
-    // by another source (user / extraSecrets).
-    for (const ph of map.placeholders()) {
-      const secret = map.secretFor(ph);
-      if (secret && !dotenvOwned.has(secret) && dotenvSourced.has(secret) && !protectedValues.has(secret)) {
-        map.remove(secret);
-        dotenvSourced.delete(secret);
+      if (!map.has(value)) {
+        map.add(value, key);
+        addSource(value, "dotenv");
+      } else {
+        addSource(value, "dotenv");
       }
     }
-    for (const [key, value] of entries) {
-      if (map.has(value)) dotenvSourced.add(value);
+    // Remove the dotenv source from secrets that are no longer in .env.
+    const entryValues = new Set(entries.values());
+    for (const [secret, sources] of [...secretSources]) {
+      if (sources.has("dotenv") && !entryValues.has(secret)) {
+        dropSource(secret, "dotenv");
+      }
     }
   }
 
   function maskMessages(messages: any[]): void {
     for (const m of messages) {
-      if (!m?.content) continue;
+      if (!m) continue;
       if (typeof m.content === "string") {
         // Some providers use plain-string content (P0-2).
         m.content = maskText(m.content);
-      } else {
-        maskDeep(m.content, (s) => maskText(s));
+      } else if (Array.isArray(m.content)) {
+        maskBlocks(m.content);
+      } else if (m.content && typeof m.content === "object" && Array.isArray(m.content.parts)) {
+        maskBlocks(m.content.parts);
+      } else if (Array.isArray(m.parts)) {
+        // Gemini contents[]: { role, parts: [...] }.
+        maskBlocks(m.parts);
       }
     }
   }
 
   function maskText(text: string): string {
     // Collect new patterns first (keys pasted in prompts, runtime-generated),
-    // then mask.
+    // then mask. Every hit also records a "regex:<name>" source so .env
+    // pruning never drops it mid-session.
     const sources = collectSecretsFromText(text, options);
     registerSources(map, sources);
+    for (const src of sources) {
+      for (const value of src.values) {
+        if (map.has(value)) addSource(value, `regex:${src.name}`);
+      }
+    }
     return map.mask(text);
   }
 
@@ -252,32 +286,41 @@ export default function (pi: any) {
    */
   function maskPayload(payload: any): void {
     if (payload == null) return;
-    // System prompt can be a string (Anthropic/Bedrock) or an array of blocks.
+    // System prompt can be a string (Anthropic/Bedrock), a block array, or
+    // Gemini's config.systemInstruction.
     if (typeof payload.system === "string") {
       payload.system = maskText(payload.system);
     } else if (Array.isArray(payload.system)) {
       maskBlocks(payload.system);
+    }
+    const si = payload.config?.systemInstruction;
+    if (typeof si === "string") {
+      payload.config.systemInstruction = maskText(si);
+    } else if (si && typeof si === "object" && Array.isArray(si.parts)) {
+      maskBlocks(si.parts);
     }
     for (const key of ["messages", "input", "contents"]) {
       const list = payload[key];
       if (Array.isArray(list)) maskMessages(list);
     }
     // Tool definitions carry descriptions that may embed secrets.
+    // OpenAI Chat: tool.function.description; Anthropic/OpenAI Responses: tool.description.
     if (Array.isArray(payload.tools)) {
       for (const tool of payload.tools) {
-        if (tool?.function?.description) tool.function.description = maskText(tool.function.description);
+        if (typeof tool?.description === "string") tool.description = maskText(tool.description);
+        if (typeof tool?.function?.description === "string") tool.function.description = maskText(tool.function.description);
       }
     }
   }
 
-  /** Mask Anthropic-style content blocks (text only; images skipped by maskDeep). */
+  /** Mask text content blocks; only the text field is touched, structural fields stay. */
   function maskBlocks(blocks: any[]): void {
     for (const block of blocks) {
       if (block && typeof block === "object" && typeof block.text === "string") {
         block.text = maskText(block.text);
-      } else if (block && typeof block === "object") {
-        maskDeep(block, (s) => maskText(s));
       }
+      // Other block types (image, tool_use, tool_result, etc.) are skipped:
+      // their string fields are structural, not free text.
     }
   }
 
@@ -318,7 +361,14 @@ export default function (pi: any) {
       }
       const unmasked = map.unmask(command);
       if (mode === "ask") {
-        const allowed = allowCommands.some((pat) => command.startsWith(pat) || new RegExp(pat).test(command));
+        const allowed = allowCommands.some((pat) => {
+          if (command.startsWith(pat)) return true;
+          try {
+            return new RegExp(pat).test(command);
+          } catch {
+            return false; // invalid pattern in config: never allow via it
+          }
+        });
         if (!allowed) {
           const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
           const ok = hasUI
@@ -420,6 +470,7 @@ export default function (pi: any) {
       }
       const ph = map.add(value, name);
       userSecrets.set(name, value);
+      addSource(value, "user");
       saveUserSecrets();
       ctx.ui.notify(`Registered ${name} → ${ph} (agent sees placeholder only)`, "info");
     },
@@ -463,6 +514,7 @@ Use case: tasks that require a secret from the user to continue.`,
       }
       const ph = map.add(value.trim(), name);
       userSecrets.set(name, value.trim());
+      addSource(value.trim(), "user");
       saveUserSecrets();
       return {
         content: [{ type: "text" as const, text: `Registered ${name}. Use placeholder ${ph} instead of the real value (bash/write substitute automatically). The real value is never exposed to you.` }],
