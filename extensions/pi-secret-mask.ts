@@ -274,9 +274,17 @@ export default function (pi: any) {
       } else if (Array.isArray(m.parts)) {
         // Gemini contents[]: { role, parts: [...] }.
         maskBlocks(m.parts);
-      } else if (m.type === "function_call_output" && typeof m.output === "string") {
-        // OpenAI Responses input blocks (P0-9).
-        m.output = maskText(m.output);
+      } else if (m.type === "function_call_output" && (typeof m.output === "string" || Array.isArray(m.output))) {
+        // OpenAI Responses input blocks (P0-9): output may be a string or
+        // an input_text array.
+        if (typeof m.output === "string") {
+          m.output = maskText(m.output);
+        } else {
+          for (const item of m.output) {
+            if (item && typeof item === "object" && typeof item.text === "string") item.text = maskText(item.text);
+            else if (typeof item === "string") m.output[m.output.indexOf(item)] = maskText(item);
+          }
+        }
       } else if (m.type === "function_call" && typeof m.arguments === "string") {
         // Function arguments are JSON text that may embed secrets.
         m.arguments = maskText(m.arguments);
@@ -317,11 +325,17 @@ export default function (pi: any) {
   function maskPayload(payload: any): void {
     if (payload == null) return;
     // System prompt can be a string (Anthropic/Bedrock), a block array, or
-    // Gemini's config.systemInstruction.
+    // Gemini's config.systemInstruction; Codex Responses uses top-level
+    // instructions (P0-10).
     if (typeof payload.system === "string") {
       payload.system = maskText(payload.system);
     } else if (Array.isArray(payload.system)) {
       maskBlocks(payload.system);
+    }
+    if (typeof payload.instructions === "string") {
+      payload.instructions = maskText(payload.instructions);
+    } else if (Array.isArray(payload.instructions)) {
+      maskBlocks(payload.instructions);
     }
     const si = payload.config?.systemInstruction;
     if (typeof si === "string") {
@@ -343,17 +357,36 @@ export default function (pi: any) {
     }
   }
 
-  /** Mask text content blocks; only the text field is touched, structural fields stay. */
+  /** Mask text content blocks; only known free-text fields are touched, structural fields stay. */
   function maskBlocks(blocks: any[]): void {
     for (const block of blocks) {
       if (!block || typeof block !== "object") continue;
       if (typeof block.text === "string") {
         block.text = maskText(block.text);
       }
-      // Known provider free-text paths (P0-9):
-      // Anthropic tool_result.content (string or nested blocks), OpenAI
-      // Responses function_call_output.output, Gemini functionResponse.response.output.
-      if (typeof block.output === "string") block.output = maskText(block.output);
+      // Known provider free-text paths (P0-9/P0-11):
+      // - OpenAI Responses function_call_output.output (string OR input_text array)
+      // - Gemini functionResponse.response.output
+      // - Anthropic tool_result.content (string or nested blocks)
+      // - Bedrock toolResult.content[].text
+      if (typeof block.output === "string") {
+        block.output = maskText(block.output);
+      } else if (Array.isArray(block.output)) {
+        for (const item of block.output) {
+          if (item && typeof item === "object" && typeof item.text === "string") {
+            item.text = maskText(item.text);
+          } else if (typeof item === "string") {
+            block.output[block.output.indexOf(item)] = maskText(item);
+          }
+        }
+      }
+      if (block.functionResponse && typeof block.functionResponse === "object") {
+        const fr = block.functionResponse;
+        if (typeof fr.response === "object" && fr.response !== null) {
+          if (typeof fr.response.output === "string") fr.response.output = maskText(fr.response.output);
+          if (typeof fr.response.error === "string") fr.response.error = maskText(fr.response.error);
+        }
+      }
       if (block.response && typeof block.response === "object" && typeof block.response.output === "string") {
         block.response.output = maskText(block.response.output);
       }
@@ -361,6 +394,9 @@ export default function (pi: any) {
         block.content = maskText(block.content);
       } else if (Array.isArray(block.content)) {
         maskBlocks(block.content);
+      }
+      if (block.toolResult && typeof block.toolResult === "object" && Array.isArray(block.toolResult.content)) {
+        maskBlocks(block.toolResult.content);
       }
       // Other block types are skipped: their string fields are structural.
     }
@@ -450,8 +486,15 @@ export default function (pi: any) {
     if (!event.content) return;
     try {
       // Output may contain runtime-generated secrets (e.g. aws sts output);
-      // collect them first, then mask.
-      maskDeep(event.content, (s) => maskText(s));
+      // collect them first, then mask. Only known text fields are touched so
+      // short .env values never corrupt block type/name structure (P1-12).
+      if (typeof event.content === "string") {
+        event.content = maskText(event.content);
+      } else if (Array.isArray(event.content)) {
+        maskBlocks(event.content);
+      } else if (event.content && typeof event.content === "object") {
+        if (typeof event.content.text === "string") event.content.text = maskText(event.content.text);
+      }
     } catch {
       // Never let masking break tool results.
     }
@@ -479,8 +522,10 @@ export default function (pi: any) {
           if (entry?.message?.content) {
             if (typeof entry.message.content === "string") {
               entry.message.content = maskText(entry.message.content);
-            } else {
-              maskDeep(entry.message.content, (s) => maskText(s));
+            } else if (Array.isArray(entry.message.content)) {
+              maskBlocks(entry.message.content);
+            } else if (Array.isArray(entry.message.content?.parts)) {
+              maskBlocks(entry.message.content.parts);
             }
           }
         }

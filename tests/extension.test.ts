@@ -37,10 +37,10 @@ function makeMockPi() {
 }
 
 async function loadExtension(tmp: string, config?: object) {
-  // Hermetic: point $HOME at a temp dir so USER_CONFIG_FILE and
-  // USER_SECRETS_FILE resolve inside the test sandbox, never the real
+  // Hermetic: point $HOME at a sandbox inside tmp (which every test already
+  // cleans up), so USER_CONFIG_FILE/USER_SECRETS_FILE never touch the real
   // ~/.pi/agent. The extension reads homedir() at load time.
-  const home = mkdtempSync(join(tmpdir(), "psm-home-"));
+  const home = join(tmp, "home");
   const cfgDir = join(home, ".pi", "agent", "extensions", "pi-secret-mask");
   mkdirSync(cfgDir, { recursive: true });
   if (config !== undefined) {
@@ -172,15 +172,20 @@ test("extension: .env rotation keeps masking history (seen source)", async (t) =
   for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
   assert.ok(JSON.stringify(p1).includes("__SECRET_OLD__"), "first request masked");
 
-  // Rotate .env: OLD removed, NEW added.
-  writeFileSync(join(tmp, ".env"), "NEW=brandnewsecretvalue789\n");
-  // Sleep so mtime changes (some filesystems have coarse timestamps).
-  await new Promise((r) => setTimeout(r, 20));
-  const p2: any = { model: "x", messages: [{ role: "user", content: "oldsecretvalue123456" }] };
+  // Rotate .env: OLD removed, NEW added. Force a distinct mtime so the
+  // refresh definitely triggers (no reliance on coarse FS timestamps).
+  const envPath = join(tmp, ".env");
+  writeFileSync(envPath, "NEW=brandnewsecretvalue789\n");
+  const now = new Date();
+  now.setSeconds(now.getSeconds() + 2);
+  const { utimesSync } = await import("node:fs");
+  utimesSync(envPath, now, now);
+  const p2: any = { model: "x", messages: [{ role: "user", content: "oldsecretvalue123456 brandnewsecretvalue789" }] };
   for (const h of handlers) await h({ type: "before_provider_request", payload: p2 }, { cwd: tmp });
   const t2 = JSON.stringify(p2);
   assert.equal(t2.includes("oldsecretvalue123456"), false, "rotated-away secret still masked in history");
   assert.ok(t2.includes("__SECRET_OLD__"), "old placeholder retained");
+  assert.ok(t2.includes("__SECRET_NEW__"), "new secret loaded and masked");
 });
 
 test("extension: structural fields survive when .env value collides with role", async (t) => {
@@ -234,4 +239,38 @@ test("extension: fail-closed aborts on masking error", async (t) => {
   });
   for (const h of handlers) await h({ type: "before_provider_request", payload: evil }, ctx);
   assert.equal(aborted, 1, "abort called on masking failure");
+});
+
+
+test("extension: provider variants — instructions, Gemini functionResponse, multimodal output, Bedrock toolResult", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=varsecretvalue123456\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+  const secret = "varsecretvalue123456";
+
+  // Codex Responses: top-level instructions (P0-10)
+  const p1: any = { model: "x", instructions: `sys ${secret}`, input: [{ role: "user", content: [{ type: "input_text", text: `hi ${secret}` }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
+  assert.ok(JSON.stringify(p1).includes("__SECRET_K__"), "instructions + input_text masked");
+  assert.equal(JSON.stringify(p1).includes(secret), false, "no plaintext in instructions payload");
+
+  // Gemini functionResponse (P0-9): part.functionResponse.response.output
+  const p2: any = { model: "gemini-x", contents: [{ role: "user", parts: [{ functionResponse: { name: "f", response: { output: secret } } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p2 }, { cwd: tmp });
+  assert.equal(p2.contents[0].parts[0].functionResponse.response.output, "__SECRET_K__", "gemini functionResponse.output masked");
+  assert.equal(p2.contents[0].parts[0].functionResponse.name, "f", "structural name untouched");
+
+  // OpenAI Responses multimodal output array (P0-9)
+  const p3: any = { model: "x", input: [{ type: "function_call_output", call_id: "1", output: [{ type: "input_text", text: secret }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p3 }, { cwd: tmp });
+  assert.equal(p3.input[0].output[0].text, "__SECRET_K__", "multimodal output array masked");
+  assert.equal(p3.input[0].call_id, "1", "structural call_id untouched");
+
+  // Bedrock Converse: content[].toolResult.content[].text (P0-11)
+  const p4: any = { model: "x", messages: [{ role: "user", content: [{ toolResult: { toolUseId: "t1", content: [{ text: secret }] } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p4 }, { cwd: tmp });
+  assert.equal(p4.messages[0].content[0].toolResult.content[0].text, "__SECRET_K__", "bedrock toolResult text masked");
+  assert.equal(p4.messages[0].content[0].toolResult.toolUseId, "t1", "structural toolUseId untouched");
 });

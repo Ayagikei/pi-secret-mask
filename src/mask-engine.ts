@@ -123,7 +123,9 @@ export function parseDotenv(content: string): { key: string; value: string }[] {
   return out;
 }
 
-/** Read .env* files from disk (later files override earlier keys). */
+/** Read .env* files from disk (later files override earlier keys).
+ * Reads are forced: a file that disappears between scan and read throws,
+ * letting the caller abort the whole refresh (P0-3 TOCTOU). */
 export function loadDotenvFiles(fs: {
   existsSync: (p: string) => boolean;
   readFileSync: (p: string) => string;
@@ -134,7 +136,7 @@ export function loadDotenvFiles(fs: {
     if (opts.exclude.includes(file)) continue;
     const path = `${baseDir}/${file}`;
     if (!fs.existsSync(path)) continue;
-    const content = fs.readFileSync(path);
+    const content = fs.readFileSync(path); // throws if it vanished -> abort refresh
     for (const { key, value } of parseDotenv(typeof content === "string" ? content : String(content))) {
       result.set(key, value);
     }
