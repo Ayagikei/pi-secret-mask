@@ -1,0 +1,36 @@
+name: Publish to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write          # required for OIDC; no NPM_TOKEN at all
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"   # NOT 22: npm 10 (Node 22) lacks OIDC publish support
+          # NO registry-url: setup-node then writes a placeholder _authToken
+          # that makes npm skip OIDC (ENEEDAUTH) or fail (E404)
+      - name: Bump version (idempotent)
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          TARGET="${{ inputs.version }}"
+          if [ -z "$TARGET" ]; then
+            # derive from tag: v1.2.3 -> 1.2.3
+            TARGET="${GITHUB_REF_NAME#v}"
+          fi
+          [ "$CURRENT" != "$TARGET" ] && npm version "$TARGET" --no-git-tag-version || echo "already $TARGET"
+      - run: npm test
+      - run: npm publish --provenance --access public
