@@ -32,5 +32,6 @@ jobs:
             TARGET="${GITHUB_REF_NAME#v}"
           fi
           [ "$CURRENT" != "$TARGET" ] && npm version "$TARGET" --no-git-tag-version || echo "already $TARGET"
+      - run: npm install --ignore-scripts  # devDependencies (typebox) for tests
       - run: npm test
       - run: npm publish --provenance --access public
