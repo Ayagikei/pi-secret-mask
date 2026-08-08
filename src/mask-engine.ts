@@ -123,25 +123,42 @@ export function parseDotenv(content: string): { key: string; value: string }[] {
   return out;
 }
 
-/** Read .env* files from disk (later files override earlier keys).
- * Reads are forced: a file that disappears between scan and read throws,
- * letting the caller abort the whole refresh (P0-3 TOCTOU). */
-export function loadDotenvFiles(fs: {
-  existsSync: (p: string) => boolean;
+/**
+ * Read .env* files from disk (later files override earlier keys).
+ *
+ * The caller passes the exact paths it saw during scanning; every path is
+ * read unconditionally (no existsSync pre-check), so a file that vanishes
+ * between scan and read throws and aborts the whole refresh (P0-3 TOCTOU).
+ */
+export function loadDotenvPaths(fs: {
   readFileSync: (p: string) => string;
-}, baseDir: string, opts: DotenvOptions): Map<string, string> {
+}, paths: string[], opts: DotenvOptions): Map<string, string> {
   const result = new Map<string, string>();
   if (!opts.enabled) return result;
-  for (const file of opts.files) {
-    if (opts.exclude.includes(file)) continue;
-    const path = `${baseDir}/${file}`;
-    if (!fs.existsSync(path)) continue;
+  for (const path of paths) {
+    if (opts.exclude.some((f) => path.endsWith(`/${f}`) || path.endsWith(f))) continue;
     const content = fs.readFileSync(path); // throws if it vanished -> abort refresh
     for (const { key, value } of parseDotenv(typeof content === "string" ? content : String(content))) {
       result.set(key, value);
     }
   }
   return result;
+}
+
+/** Legacy wrapper: resolves configured .env files itself (used by tests/other callers). */
+export function loadDotenvFiles(fs: {
+  existsSync: (p: string) => boolean;
+  readFileSync: (p: string) => string;
+}, baseDir: string, opts: DotenvOptions): Map<string, string> {
+  const result = new Map<string, string>();
+  if (!opts.enabled) return result;
+  const paths: string[] = [];
+  for (const file of opts.files) {
+    if (opts.exclude.includes(file)) continue;
+    const path = `${baseDir}/${file}`;
+    if (fs.existsSync(path)) paths.push(path);
+  }
+  return loadDotenvPaths({ readFileSync: fs.readFileSync }, paths, opts);
 }
 
 /** Extract all regex matches from text (global match, deduped, sorted by length descending). */

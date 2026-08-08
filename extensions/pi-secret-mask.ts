@@ -21,7 +21,7 @@ import {
   DEFAULT_MASK_OPTIONS,
   MaskMap,
   collectSecretsFromText,
-  loadDotenvFiles,
+  loadDotenvPaths,
   maskDeep,
   registerSources,
   type MaskOptions,
@@ -229,7 +229,9 @@ export default function (pi: any) {
     if (!changed) return;
     let entries: Map<string, string>;
     try {
-      entries = loadDotenvFiles({ existsSync, readFileSync }, baseDir, options.dotenv);
+      // Read exactly the paths seen during scanning, unconditionally:
+      // a vanished file throws and aborts the whole refresh (P0-3 TOCTOU).
+      entries = loadDotenvPaths({ readFileSync }, [...scanned.keys()], options.dotenv);
     } catch {
       // .env changed but is unreadable: keep the old mapping (do NOT commit
       // mtime, so we retry next request; never abort the provider hook).
@@ -274,15 +276,16 @@ export default function (pi: any) {
       } else if (Array.isArray(m.parts)) {
         // Gemini contents[]: { role, parts: [...] }.
         maskBlocks(m.parts);
-      } else if (m.type === "function_call_output" && (typeof m.output === "string" || Array.isArray(m.output))) {
-        // OpenAI Responses input blocks (P0-9): output may be a string or
-        // an input_text array.
+      } else if ((m.type === "function_call_output" || m.type === "custom_tool_call_output") && (typeof m.output === "string" || Array.isArray(m.output))) {
+        // OpenAI Responses input blocks (P0-9/P0-N4): output may be a string
+        // or an input_text array. Grammar-tool paths use custom_tool_call_output.
         if (typeof m.output === "string") {
           m.output = maskText(m.output);
         } else {
-          for (const item of m.output) {
+          for (let i = 0; i < m.output.length; i++) {
+            const item = m.output[i];
             if (item && typeof item === "object" && typeof item.text === "string") item.text = maskText(item.text);
-            else if (typeof item === "string") m.output[m.output.indexOf(item)] = maskText(item);
+            else if (typeof item === "string") m.output[i] = maskText(item);
           }
         }
       } else if (m.type === "function_call" && typeof m.arguments === "string") {
@@ -335,7 +338,11 @@ export default function (pi: any) {
     if (typeof payload.instructions === "string") {
       payload.instructions = maskText(payload.instructions);
     } else if (Array.isArray(payload.instructions)) {
-      maskBlocks(payload.instructions);
+      for (let i = 0; i < payload.instructions.length; i++) {
+        const item = payload.instructions[i];
+        if (typeof item === "string") payload.instructions[i] = maskText(item);
+        else if (item && typeof item === "object") maskBlocks([item]);
+      }
     }
     const si = payload.config?.systemInstruction;
     if (typeof si === "string") {
@@ -372,11 +379,12 @@ export default function (pi: any) {
       if (typeof block.output === "string") {
         block.output = maskText(block.output);
       } else if (Array.isArray(block.output)) {
-        for (const item of block.output) {
+        for (let i = 0; i < block.output.length; i++) {
+          const item = block.output[i];
           if (item && typeof item === "object" && typeof item.text === "string") {
             item.text = maskText(item.text);
           } else if (typeof item === "string") {
-            block.output[block.output.indexOf(item)] = maskText(item);
+            block.output[i] = maskText(item);
           }
         }
       }
@@ -507,6 +515,10 @@ export default function (pi: any) {
       refreshDotenv(ctx?.cwd ?? process.cwd());
       if (Array.isArray(prep.messagesToSummarize)) maskMessages(prep.messagesToSummarize);
       if (Array.isArray(prep.turnPrefixMessages)) maskMessages(prep.turnPrefixMessages);
+      // Provider-bound custom instructions may embed secrets (P0-N6).
+      if (typeof prep.customInstructions === "string") {
+        prep.customInstructions = maskText(prep.customInstructions);
+      }
     } catch {
       // Never abort compaction.
     }
@@ -519,16 +531,23 @@ export default function (pi: any) {
       refreshDotenv(ctx?.cwd ?? process.cwd());
       if (Array.isArray(prep.entriesToSummarize)) {
         for (const entry of prep.entriesToSummarize) {
-          if (entry?.message?.content) {
-            if (typeof entry.message.content === "string") {
-              entry.message.content = maskText(entry.message.content);
-            } else if (Array.isArray(entry.message.content)) {
-              maskBlocks(entry.message.content);
-            } else if (Array.isArray(entry.message.content?.parts)) {
-              maskBlocks(entry.message.content.parts);
+          // Both message entries and custom_message entries feed branch
+          // summaries (P0-N5).
+          const msg = entry?.message ?? entry?.custom_message;
+          if (msg?.content) {
+            if (typeof msg.content === "string") {
+              msg.content = maskText(msg.content);
+            } else if (Array.isArray(msg.content)) {
+              maskBlocks(msg.content);
+            } else if (Array.isArray(msg.content?.parts)) {
+              maskBlocks(msg.content.parts);
             }
           }
         }
+      }
+      // Provider-bound custom instructions may embed secrets (P0-N6).
+      if (typeof prep.customInstructions === "string") {
+        prep.customInstructions = maskText(prep.customInstructions);
       }
     } catch {
       // Never abort tree navigation.

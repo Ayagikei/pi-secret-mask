@@ -274,3 +274,71 @@ test("extension: provider variants — instructions, Gemini functionResponse, mu
   assert.equal(p4.messages[0].content[0].toolResult.content[0].text, "__SECRET_K__", "bedrock toolResult text masked");
   assert.equal(p4.messages[0].content[0].toolResult.toolUseId, "t1", "structural toolUseId untouched");
 });
+
+test("extension: custom_tool_call_output and instructions array masked", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=ctco_secret_value123456\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+  const secret = "ctco_secret_value123456";
+
+  // Grammar-tool path: custom_tool_call_output (P0-N4)
+  const p1: any = { model: "x", input: [{ type: "custom_tool_call_output", call_id: "c1", output: secret }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
+  assert.equal(p1.input[0].output, "__SECRET_K__", "custom_tool_call_output masked");
+  assert.equal(p1.input[0].call_id, "c1", "structural call_id untouched");
+
+  // instructions as string array (P0-10)
+  const p2: any = { model: "x", instructions: [`sys ${secret}`, "other"] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p2 }, { cwd: tmp });
+  assert.equal(p2.instructions[0], "sys __SECRET_K__", "instructions array element masked");
+  assert.equal(p2.instructions[1], "other", "unrelated instruction untouched");
+});
+
+test("extension: tree hook masks custom_message and customInstructions", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=tree_secret_value123456\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const treeHandlers = pi.handlers.get("session_before_tree")!;
+  const secret = "tree_secret_value123456";
+
+  const event: any = {
+    type: "session_before_tree",
+    preparation: {
+      entriesToSummarize: [
+        { type: "message", message: { role: "user", content: `msg ${secret}` } },
+        { type: "custom_message", custom_message: { role: "user", content: `custom ${secret}` } },
+      ],
+      customInstructions: `instr ${secret}`,
+    },
+    signal: undefined,
+  };
+  for (const h of treeHandlers) await h(event, { cwd: tmp });
+  assert.equal(event.preparation.entriesToSummarize[0].message.content, "msg __SECRET_K__", "message entry masked");
+  assert.equal(event.preparation.entriesToSummarize[1].custom_message.content, "custom __SECRET_K__", "custom_message masked");
+  assert.equal(event.preparation.customInstructions, "instr __SECRET_K__", "customInstructions masked");
+});
+
+test("extension: .env vanishing between scan and read aborts refresh (TOCTOU)", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "OLD=oldvaluetooctou12345\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+
+  // Prime with OLD actually appearing in history (gets the "seen" source,
+  // which is what keeps history masked after rotation).
+  const p0: any = { model: "x", messages: [{ role: "user", content: "oldvaluetooctou12345" }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p0 }, { cwd: tmp });
+  assert.ok(JSON.stringify(p0).includes("__SECRET_OLD__"), "primed request masked");
+
+  // Delete the file: next refresh sees it as disappeared (changed). The
+  // refresh must not throw, must not leak the old value in history, and the
+  // seen source keeps the mapping alive.
+  rmSync(join(tmp, ".env"));
+  const p1: any = { model: "x", messages: [{ role: "user", content: "oldvaluetooctou12345" }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
+  assert.equal(JSON.stringify(p1).includes("oldvaluetooctou12345"), false, "old value stays masked after file removal");
+});
