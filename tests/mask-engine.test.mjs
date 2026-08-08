@@ -10,7 +10,7 @@ import {
   registerSources,
 } from "../src/mask-engine.ts";
 
-test("MaskMap: 基本掩码与还原", () => {
+test("MaskMap: basic mask and unmask", () => {
   const m = new MaskMap();
   m.add("sk-secret-abcdef123456", "OPENAI");
   const masked = m.mask("use sk-secret-abcdef123456 here");
@@ -18,7 +18,7 @@ test("MaskMap: 基本掩码与还原", () => {
   assert.equal(m.unmask(masked), "use sk-secret-abcdef123456 here");
 });
 
-test("MaskMap: 多占位符独立回滚", () => {
+test("MaskMap: multiple placeholders roll back independently", () => {
   const m = new MaskMap();
   m.add("token-A", "KEYA");
   m.add("token-B", "KEYB");
@@ -28,7 +28,7 @@ test("MaskMap: 多占位符独立回滚", () => {
   assert.equal(m.unmask(masked), text);
 });
 
-test("MaskMap: 同名 secret 自动编号", () => {
+test("MaskMap: same-name secrets are auto-numbered", () => {
   const m = new MaskMap();
   m.add("val-1", "API_KEY");
   m.add("val-2", "API_KEY");
@@ -37,7 +37,7 @@ test("MaskMap: 同名 secret 自动编号", () => {
   assert.equal(m.unmask(m.mask("val-1 val-2")), "val-1 val-2");
 });
 
-test("MaskMap: 子串冲突按长度降序（sk-ab 不被 sk-abc 破坏）", () => {
+test("MaskMap: substring collisions resolved by length-descending order (sk-ab not clobbered by sk-abc)", () => {
   const m = new MaskMap();
   m.add("sk-abc", "A");
   m.add("sk-ab", "B");
@@ -47,18 +47,18 @@ test("MaskMap: 子串冲突按长度降序（sk-ab 不被 sk-abc 破坏）", () 
   assert.equal(m.unmask(masked), text);
 });
 
-test("MaskMap: 还原只认已知占位符", () => {
+test("MaskMap: unmask only recognizes known placeholders", () => {
   const m = new MaskMap();
   m.add("real-value", "TOK");
-  // 非已知占位符不还原
+  // Unknown placeholders are not unmasked
   assert.equal(m.unmask("__SECRET_UNKNOWN__"), "__SECRET_UNKNOWN__");
-  assert.equal(m.unmask("__SECRET_TOK__x"), "__SECRET_TOK__x"); // 非完整 token
-  // 已知占位符还原
+  assert.equal(m.unmask("__SECRET_TOK__x"), "__SECRET_TOK__x"); // not a whole token
+  // Known placeholders are unmasked
   assert.equal(m.unmask(m.mask("real-value")), "real-value");
   assert.equal(m.unmask("__SECRET_TOK__"), "real-value");
 });
 
-test("MaskMap: 掩码后还原不改变原文本", () => {
+test("MaskMap: mask then unmask restores original text", () => {
   const m = new MaskMap();
   m.add("alpha", "A");
   m.add("beta", "B");
@@ -68,7 +68,7 @@ test("MaskMap: 掩码后还原不改变原文本", () => {
   assert.equal(m.unmask(masked), original);
 });
 
-test("maskDeep: 递归掩码数组/对象中的字符串", () => {
+test("maskDeep: recursively masks strings in arrays/objects", () => {
   const m = new MaskMap();
   m.add("topsecret-123", "K");
   const obj = {
@@ -85,7 +85,7 @@ test("maskDeep: 递归掩码数组/对象中的字符串", () => {
   assert.equal(obj.d, 42);
 });
 
-test("maskDeep: 无命中返回 false", () => {
+test("maskDeep: returns false when nothing matches", () => {
   const m = new MaskMap();
   m.add("secret-x", "K");
   const obj = { a: "nothing here" };
@@ -93,13 +93,13 @@ test("maskDeep: 无命中返回 false", () => {
   assert.equal(obj.a, "nothing here");
 });
 
-test("parseDotenv: 引号/export/注释/CRLF/值含=", () => {
+test("parseDotenv: quotes/export/comments/CRLF/values containing =", () => {
   const content = [
     "KEY1=plain",
     'KEY2="quoted value"',
     "export KEY3=exported",
     "KEY4=value with = sign",
-    "KEY5=trailing # not comment", // 无引号：' #' 才剥离
+    "KEY5=trailing # not comment", // no quotes: only ' #' is stripped
     'KEY6="inline # keeps"',
     "# comment line",
     "",
@@ -111,17 +111,17 @@ test("parseDotenv: 引号/export/注释/CRLF/值含=", () => {
   assert.equal(map.get("KEY2"), "quoted value");
   assert.equal(map.get("KEY3"), "exported");
   assert.equal(map.get("KEY4"), "value with = sign");
-  assert.equal(map.get("KEY5"), "trailing"); // ' #' 前有空格 → 注释剥离
+  assert.equal(map.get("KEY5"), "trailing"); // ' #' preceded by space -> comment stripped
   assert.equal(map.get("KEY6"), "inline # keeps");
   assert.equal(map.get("KEY7"), "crlf");
 });
 
-test("parseDotenv: 忽略无值行与非法 key", () => {
+test("parseDotenv: skips empty values and invalid keys", () => {
   const entries = parseDotenv("EMPTY=\n1BAD=no\nOK=yes");
   assert.deepEqual(entries, [{ key: "OK", value: "yes" }]);
 });
 
-test("collectPatternSecrets: 内置正则识别", () => {
+test("collectPatternSecrets: built-in regexes", () => {
   const opts = {
     extraSecrets: [],
     customPatterns: [],
@@ -135,7 +135,7 @@ test("collectPatternSecrets: 内置正则识别", () => {
   assert.deepEqual(names, ["GITHUB", "OPENAI"]);
 });
 
-test("collectPatternSecrets: 自定义正则", () => {
+test("collectPatternSecrets: custom regexes", () => {
   const opts = {
     extraSecrets: [],
     customPatterns: [{ name: "MY_SECRET", pattern: "mysec-[a-z0-9]{8}" }],
@@ -147,7 +147,7 @@ test("collectPatternSecrets: 自定义正则", () => {
   assert.deepEqual(sources, [{ name: "MY_SECRET", values: ["mysec-abc12345"] }]);
 });
 
-test("collectPatternSecrets: 捕获组优先", () => {
+test("collectPatternSecrets: capture group wins", () => {
   const sources = collectPatternSecrets(
     [{ name: "JWT", re: /(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/g }],
     "tok: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
@@ -156,35 +156,35 @@ test("collectPatternSecrets: 捕获组优先", () => {
   assert.ok(sources[0].values[0].startsWith("eyJ"));
 });
 
-test("registerSources + pruneSecrets: 增量更新与清理", () => {
+test("registerSources + pruneSecrets: incremental update and cleanup", () => {
   const m = new MaskMap();
   const active = new Set(["a", "b"]);
   registerSources(m, [{ name: "K", values: ["a", "b"] }]);
   assert.equal(m.size, 2);
-  registerSources(m, [{ name: "K", values: ["a", "c"] }]); // 新增 c
+  registerSources(m, [{ name: "K", values: ["a", "c"] }]); // adds c
   assert.equal(m.size, 3);
   assert.equal(m.remove ? true : true, true);
-  pruneSecrets(m, new Set(["a", "c"])); // b 已删除
+  pruneSecrets(m, new Set(["a", "c"])); // b was removed
   assert.equal(m.size, 2);
   assert.equal(m.has("a"), true);
   assert.equal(m.has("b"), false);
   assert.equal(m.has("c"), true);
 });
 
-test("MaskMap: 占位符自身不重复注册（防双重掩码）", () => {
+test("MaskMap: placeholders are not re-registered (prevents double masking)", () => {
   const m = new MaskMap();
   m.add("sk-real-1234567890abcdef", "OPENAI_API_KEY");
-  // .env 里写回了占位符 → 不应注册为新 secret
+  // A placeholder written back into .env must not register as a new secret
   const ph = m.placeholderFor("sk-real-1234567890abcdef");
   if (ph) m.add(ph, "OPENAI_API_KEY");
   assert.equal(m.placeholderFor("sk-real-1234567890abcdef"), "__SECRET_OPENAI_API_KEY__");
-  // 无 _2 变体
+  // No _2 variant
   assert.equal(m.has("__SECRET_OPENAI_API_KEY__"), false);
   assert.equal(m.placeholders().length, 1);
 });
 
 
-test("MaskMap: 短值也参与掩码（全部走掩码策略）", () => {
+test("MaskMap: short values are masked too (mask-everything policy)", () => {
   const m = new MaskMap();
   m.add("1", "TEST");
   const masked = m.mask("TEST=1");
@@ -192,7 +192,7 @@ test("MaskMap: 短值也参与掩码（全部走掩码策略）", () => {
   assert.equal(m.unmask(masked), "TEST=1");
 });
 
-test("maskDeep: write/edit 内容还原（占位符 → 真实值）", () => {
+test("maskDeep: write/edit content unmasked (placeholder -> real value)", () => {
   const m = new MaskMap();
   m.add("sk-real-1234567890abcdef", "OPENAI_API_KEY");
   const input = {

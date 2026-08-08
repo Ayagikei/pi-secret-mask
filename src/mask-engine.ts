@@ -1,34 +1,34 @@
 /**
- * pi-secret-mask 掩码引擎
+ * pi-secret-mask masking engine.
  *
- * 职责：
- * - 收集 secret（.env 解析、正则模式、自定义正则、手动补充）
- * - secret ↔ 占位符双向映射
- * - 文本掩码（真实值 → 占位符，单趟 alternation 正则）
- * - 文本还原（占位符 → 真实值，精确匹配）
+ * Responsibilities:
+ * - Collect secrets (.env parsing, regex patterns, custom regexes, manual extras)
+ * - Bidirectional secret <-> placeholder mapping
+ * - Mask text (real value -> placeholder, single-pass alternation regex)
+ * - Unmask text (placeholder -> real value, exact match)
  */
 
 export interface SecretSource {
-  /** 唯一来源名，用于占位符命名（.env KEY / 模式名 / 自定义名） */
+  /** Unique source name, used for placeholder naming (.env KEY / pattern name / custom name). */
   name: string;
-  /** 值列表 */
+  /** Values. */
   values: string[];
 }
 
 export interface DotenvOptions {
   enabled: boolean;
   files: string[];
-  /** 排除的文件（如 .env.example） */
+  /** Files to exclude (e.g. .env.example). */
   exclude: string[];
 }
 
 export interface MaskOptions {
-  /** 手动补充的 secret */
+  /** Manually supplied secrets. */
   extraSecrets: { name: string; value: string }[];
-  /** 用户自定义正则规则 */
+  /** User-defined regex rules. */
   customPatterns: { name: string; pattern: string; flags?: string }[];
   dotenv: DotenvOptions;
-  /** 内置正则模式开关 */
+  /** Built-in regex pattern toggles. */
   patterns: {
     openai: boolean;
     github: boolean;
@@ -38,7 +38,7 @@ export interface MaskOptions {
     pem: boolean;
     base64: boolean;
   };
-  /** 高熵 base64 最小长度（默认关） */
+  /** Minimum length for high-entropy base64 (off by default). */
   base64MinLength: number;
 }
 
@@ -62,7 +62,7 @@ export const DEFAULT_MASK_OPTIONS: MaskOptions = {
   base64MinLength: 32,
 };
 
-/** 内置正则模式。捕获组必须把整个 secret 包在组 1。 */
+/** Built-in regex patterns. A capture group must wrap the whole secret in group 1. */
 function builtinPatterns(opts: MaskOptions["patterns"]): { name: string; re: RegExp }[] {
   const out: { name: string; re: RegExp }[] = [];
   const add = (name: string, enabled: boolean, source: string, flags = "g") => {
@@ -78,7 +78,7 @@ function builtinPatterns(opts: MaskOptions["patterns"]): { name: string; re: Reg
   return out;
 }
 
-/** 解析 .env 内容为 KEY=VALUE 列表。规则：引号剥离、export 前缀、行内注释、CRLF、值可含 =。 */
+/** Parse .env content into KEY=VALUE pairs. Rules: quote stripping, export prefix, inline comments, CRLF, values may contain =. */
 export function parseDotenv(content: string): { key: string; value: string }[] {
   const out: { key: string; value: string }[] = [];
   for (let rawLine of content.split(/\r?\n/)) {
@@ -90,12 +90,12 @@ export function parseDotenv(content: string): { key: string; value: string }[] {
     if (key.startsWith("export ")) key = key.slice(7).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     let value = line.slice(eq + 1).trim();
-    // 行内注释：只在引号外生效（简化：值以引号开头时不做注释剥离）
+    // Inline comments only apply outside quotes (simplified: values starting with a quote are not comment-stripped).
     const firstQuote = value[0];
     if (firstQuote === '"' || firstQuote === "'") {
       const closing = value.indexOf(firstQuote, 1);
       if (closing > 0) value = value.slice(1, closing);
-      // 无闭合引号：取整行
+      // No closing quote: take the whole line.
     } else {
       const hash = value.indexOf(" #");
       if (hash >= 0) value = value.slice(0, hash).trim();
@@ -105,7 +105,7 @@ export function parseDotenv(content: string): { key: string; value: string }[] {
   return out;
 }
 
-/** 从磁盘读取 .env* 文件（按优先级：后者覆盖前者）。 */
+/** Read .env* files from disk (later files override earlier keys). */
 export function loadDotenvFiles(fs: {
   existsSync: (p: string) => boolean;
   readFileSync: (p: string) => string;
@@ -124,7 +124,7 @@ export function loadDotenvFiles(fs: {
   return result;
 }
 
-/** 从文本中提取所有正则命中（全局匹配，去重，按长度降序）。 */
+/** Extract all regex matches from text (global match, deduped, sorted by length descending). */
 export function collectPatternSecrets(patterns: { name: string; re: RegExp }[], text: string): SecretSource[] {
   const byName = new Map<string, Set<string>>();
   for (const { name, re } of patterns) {
@@ -136,7 +136,7 @@ export function collectPatternSecrets(patterns: { name: string; re: RegExp }[], 
         if (!byName.has(name)) byName.set(name, new Set());
         byName.get(name)!.add(value);
       }
-      if (m[0].length === 0) re.lastIndex++; // 防死循环
+      if (m[0].length === 0) re.lastIndex++; // guard against infinite loops
     }
   }
   return [...byName.entries()].map(([name, values]) => ({
@@ -145,22 +145,22 @@ export function collectPatternSecrets(patterns: { name: string; re: RegExp }[], 
   }));
 }
 
-/** 占位符自身形态（防已掩码内容被重新收集） */
+/** Placeholder shape (prevents already-masked content from being re-collected). */
 const PLACEHOLDER_RE = /^__SECRET_[A-Za-z0-9_]+(__\d+)?__$/;
 
-/** 掩码映射：维护 secret ↔ 占位符。 */
+/** Masking map: maintains secret <-> placeholder. */
 export class MaskMap {
   private secretToPlaceholder = new Map<string, string>();
   private placeholderToSecret = new Map<string, string>();
   private nameCounts = new Map<string, number>();
-  /** 按长度降序的 secret 列表（用于 alternation 构造） */
+  /** Secrets sorted by length descending (for alternation construction). */
   private sortedSecrets: string[] = [];
 
-  /** 注册 secret。同名自动编号。返回占位符。 */
+  /** Register a secret. Same-name values are auto-numbered. Returns the placeholder. */
   add(secret: string, baseName: string): string {
     const existing = this.secretToPlaceholder.get(secret);
     if (existing) return existing;
-    if (PLACEHOLDER_RE.test(secret)) return secret; // 占位符自身不再注册
+    if (PLACEHOLDER_RE.test(secret)) return secret; // never re-register placeholders
     const n = (this.nameCounts.get(baseName) ?? 0) + 1;
     this.nameCounts.set(baseName, n);
     const placeholder = n === 1 ? `__SECRET_${baseName}__` : `__SECRET_${baseName}_${n}__`;
@@ -170,7 +170,7 @@ export class MaskMap {
     return placeholder;
   }
 
-  /** 移除 secret（.env 中已删除的 key）。 */
+  /** Remove a secret (e.g. a key deleted from .env). */
   remove(secret: string): void {
     const ph = this.secretToPlaceholder.get(secret);
     if (!ph) return;
@@ -199,7 +199,7 @@ export class MaskMap {
     return [...this.placeholderToSecret.keys()];
   }
 
-  /** 掩码：真实值 → 占位符。单趟 alternation（按长度降序，防子串冲突）。 */
+  /** Mask: real value -> placeholder. Single-pass alternation (length-descending, no substring collisions). */
   mask(text: string): string {
     if (this.sortedSecrets.length === 0) return text;
     const re = new RegExp(
@@ -209,7 +209,7 @@ export class MaskMap {
     return text.replace(re, (m) => this.secretToPlaceholder.get(m) ?? m);
   }
 
-  /** 还原：占位符 → 真实值。只精确匹配已知占位符（完整 token，前后不接标识符字符）。 */
+  /** Unmask: placeholder -> real value. Only matches known placeholders as whole tokens (not adjacent to identifier chars). */
   unmask(text: string): string {
     if (this.placeholderToSecret.size === 0) return text;
     const re = new RegExp(
@@ -219,12 +219,12 @@ export class MaskMap {
     return text.replace(re, (m) => this.placeholderToSecret.get(m) ?? m);
   }
 
-  /** 递归掩码任意结构（消息 content 数组等），返回是否修改过。 */
+  /** Recursively mask any structure (message content arrays etc.). Returns whether anything changed. */
   maskDeep(value: unknown): boolean {
     return maskDeep(value, (s) => this.mask(s));
   }
 
-  /** 递归还原任意结构。 */
+  /** Recursively unmask any structure. */
   unmaskDeep(value: unknown): boolean {
     return maskDeep(value, (s) => this.unmask(s));
   }
@@ -234,9 +234,9 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** 遍历对象/数组/字符串，对 text 字段应用 fn。返回是否修改过。 */
+/** Walk objects/arrays and apply fn to string fields. Returns whether anything changed. */
 export function maskDeep(value: unknown, fn: (text: string) => string): boolean {
-  if (typeof value === "string") return false; // 字符串容器由调用方处理
+  if (typeof value === "string") return false; // string containers are handled by the caller
   if (Array.isArray(value)) {
     let changed = false;
     for (let i = 0; i < value.length; i++) {
@@ -272,7 +272,7 @@ export function maskDeep(value: unknown, fn: (text: string) => string): boolean 
   return false;
 }
 
-/** 从文本中收集 secret：内置模式 + 自定义正则。 */
+/** Collect secrets from text: built-in patterns + custom regexes. */
 export function collectSecretsFromText(
   text: string,
   opts: MaskOptions,
@@ -282,13 +282,13 @@ export function collectSecretsFromText(
     try {
       patterns.push({ name: cp.name, re: new RegExp(cp.pattern, cp.flags ?? "g") });
     } catch {
-      // 忽略非法自定义正则
+      // Ignore invalid custom regexes.
     }
   }
   return collectPatternSecrets(patterns, text);
 }
 
-/** 把收集到的 source 注册进 map。返回本次新增数。 */
+/** Register collected sources into the map. Returns the number of new secrets added. */
 export function registerSources(map: MaskMap, sources: SecretSource[]): number {
   let added = 0;
   for (const src of sources) {
@@ -302,7 +302,7 @@ export function registerSources(map: MaskMap, sources: SecretSource[]): number {
   return added;
 }
 
-/** 同步移除 map 中已不存在的 secret（基于当前活跃集合）。 */
+/** Remove secrets from the map that are no longer in the active set. */
 export function pruneSecrets(map: MaskMap, active: Set<string>): number {
   let removed = 0;
   for (const ph of map.placeholders()) {
