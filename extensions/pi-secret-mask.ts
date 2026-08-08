@@ -7,12 +7,14 @@
  * - tool_result：工具输出真实值 → 占位符（防回流）
  * - session_before_compact / session_before_tree：摘要消息同样掩码
  * - /mask-secret：用户输入密钥注册，agent 只见占位符（持久化到用户目录）
+ * - request_secret：agent 主动请求密钥，用户输入后自动掩码，agent 只见占位符
  *
  * 配置：优先 ~/.pi/agent/extensions/pi-secret-mask/config.json，其次扩展同目录。
  */
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { Type } from "typebox";
 import { homedir } from "os";
 import {
   DEFAULT_MASK_OPTIONS,
@@ -251,6 +253,50 @@ export default function (pi: any) {
       userSecrets.set(name, value);
       saveUserSecrets();
       ctx.ui.notify(`已注册 ${name} → ${ph}（agent 只见占位符）`, "info");
+    },
+  });
+
+  // request_secret：agent 主动请求密钥，用户输入后自动掩码，agent 只见占位符
+  pi.registerTool({
+    name: "request_secret",
+    label: "Request Secret",
+    description: `向用户请求一个 secret（API key/token/密码等）并注册到掩码系统。
+用户输入的值会被掩码为占位符，你（agent）只看到占位符，不会接触真实值。
+之后把占位符用于 bash 命令或写入文件即可，扩展会自动替换为真实值。
+场景：需要用户提供密钥才能继续的任务。`,
+    parameters: Type.Object({
+      name: Type.String({ description: "密钥名，如 OPENAI_API_KEY、GITHUB_TOKEN" }),
+      purpose: Type.Optional(Type.String({ description: "用途说明，展示给用户" })),
+    }),
+    execute: async (
+      _id: string,
+      params: { name: string; purpose?: string },
+      _signal: unknown,
+      _onUpdate: unknown,
+      ctx: any,
+    ) => {
+      const name = params.name?.trim() || "USER";
+      const purpose = params.purpose?.trim();
+      if (!ctx?.ui?.input) {
+        return {
+          content: [{ type: "text" as const, text: "当前模式无交互 UI（print/json），无法向用户请求密钥。请让用户通过 /mask-secret 命令注册后再继续。" }],
+        };
+      }
+      const value = (await ctx.ui.input(
+        purpose ? `输入 ${name}（用途：${purpose}，agent 不会看到）：` : `输入 ${name}（agent 不会看到）：`,
+        "",
+      )) ?? "";
+      if (!value.trim()) {
+        return {
+          content: [{ type: "text" as const, text: `用户取消了 ${name} 的输入` }],
+        };
+      }
+      const ph = map.add(value.trim(), name);
+      userSecrets.set(name, value.trim());
+      saveUserSecrets();
+      return {
+        content: [{ type: "text" as const, text: `已注册 ${name}。使用占位符 ${ph} 代替真实值（bash 命令/写文件时扩展会自动替换）。真实值不会暴露给你。` }],
+      };
     },
   });
 }

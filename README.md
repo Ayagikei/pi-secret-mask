@@ -6,6 +6,27 @@
 工具输出中的真实值再掩码回占位符——形成闭环，secret 不进 provider 请求，
 也不通过工具输出回流。
 
+## 使用
+
+### 自动掩码（无需配置）
+
+- **prompt 中的密钥**：粘贴 `sk-...`、`ghp_...` 等常见格式密钥到对话里，自动识别并掩码
+- **`.env` 文件**：自动解析项目 `.env*`（`KEY=VALUE`），会话中修改会增量刷新
+- **自定义正则**：`config.json` 的 `customPatterns` 添加规则
+
+### 手动注册密钥
+
+**用户主动**：`/mask-secret MY_KEY my-secret-value`（或直接 `/mask-secret` 交互输入）
+
+**Agent 主动**：agent 调用 `request_secret` 工具（参数 `name`，可选 `purpose`），用户在弹出的输入框里填密钥，agent 只拿到占位符：
+
+```
+已注册 MY_KEY。使用占位符 __SECRET_MY_KEY__ 代替真实值
+```
+
+注册的密钥持久化在 `~/.pi/agent/extensions/pi-secret-mask/secrets.json`（0600），重启保留。
+Agent 在 bash 命令或写文件时使用占位符，扩展自动替换为真实值（写回文件存的是真值，新值不受影响）。
+
 ## 工作原理
 
 | 钩子 | 动作 |
@@ -15,6 +36,7 @@
 | `tool_result` | 工具输出：真实值 → 占位符（防回流） |
 | `session_before_compact` | compaction 摘要消息同样掩码 |
 | `session_before_tree` | branch/tree 摘要消息同样掩码 |
+| `request_secret` 工具 | agent 主动请求密钥，用户输入后注册，agent 只见占位符 |
 
 secret 来源：
 - `.env*` 文件（KEY=VALUE，支持引号/export/注释/CRLF），会话中修改会
