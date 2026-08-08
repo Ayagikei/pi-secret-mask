@@ -285,6 +285,54 @@ function escapeRegExp(s: string): string {
 }
 
 /**
+ * Deep mask for free-form JSON (tool inputs/args): unlike provider content
+ * blocks, these objects are arbitrary user data, so image-like shapes must
+ * NOT be skipped as a whole — only genuinely binary fields (base64 data/
+ * bytes) are left untouched (P0-10/11/12).
+ */
+export function maskDeepFreeform(value: unknown, fn: (text: string) => string): boolean {
+  if (typeof value === "string") return false;
+  if (Array.isArray(value)) {
+    let changed = false;
+    for (let i = 0; i < value.length; i++) {
+      const item = value[i];
+      if (typeof item === "string") {
+        const next = fn(item);
+        if (next !== item) {
+          value[i] = next;
+          changed = true;
+        }
+      } else if (item && typeof item === "object") {
+        changed = maskDeepFreeform(item, fn) || changed;
+      }
+    }
+    return changed;
+  }
+  if (value && typeof value === "object") {
+    let changed = false;
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      // Skip binary payload fields only.
+      if (key === "data" || key === "bytes" || key === "image" || key === "inlineData") {
+        const v = (value as Record<string, unknown>)[key];
+        if (typeof v === "string" || v === null) continue;
+      }
+      const item = (value as Record<string, unknown>)[key];
+      if (typeof item === "string") {
+        const next = fn(item);
+        if (next !== item) {
+          (value as Record<string, unknown>)[key] = next;
+          changed = true;
+        }
+      } else if (item && typeof item === "object") {
+        changed = maskDeepFreeform(item, fn) || changed;
+      }
+    }
+    return changed;
+  }
+  return false;
+}
+
+/**
  * Walk objects/arrays and apply fn to string fields. Returns whether anything changed.
  * Image/binary nodes (type "image"/"input_image") are skipped so base64 data is never touched.
  */

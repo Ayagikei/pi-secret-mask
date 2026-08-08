@@ -511,3 +511,35 @@ test("extension: tool-call arguments and reasoning fields masked", async (t) => 
   for (const h of handlers) await h({ type: "before_provider_request", payload: p8 }, { cwd: tmp });
   assert.equal(p8.messages[0].content[0].reasoningContent.reasoningText.text, "think __SECRET_K__", "bedrock reasoningText masked");
 });
+
+test("extension: Mistral camelCase toolCalls, chat custom.input, image-like freeform JSON", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=mistral_secret_value1234\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request")!;
+  const secret = "mistral_secret_value1234";
+  await handlers[0]({ type: "before_provider_request", payload: { model: "x", messages: [] } }, { cwd: tmp });
+
+  // Mistral: camelCase toolCalls[].function.arguments (P0-9)
+  const p1: any = { model: "x", messages: [{ role: "assistant", content: "", toolCalls: [{ id: "t1", type: "function", function: { name: "f", arguments: `{"k":"${secret}"}` } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p1 }, { cwd: tmp });
+  assert.ok(JSON.stringify(p1).includes("__SECRET_K__"), "mistral toolCalls masked");
+  assert.equal(JSON.stringify(p1).includes(secret), false, "no plaintext in mistral toolCalls");
+
+  // OpenAI Chat custom tool call (P0-18)
+  const p2: any = { model: "x", messages: [{ role: "assistant", content: null, tool_calls: [{ id: "t2", type: "custom", custom: { name: "f", input: secret } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p2 }, { cwd: tmp });
+  assert.equal(p2.messages[0].tool_calls[0].custom.input, "__SECRET_K__", "custom.input masked");
+
+  // Anthropic tool_use.input with image-like nested object must NOT skip (P0-10)
+  const p3: any = { model: "x", messages: [{ role: "assistant", content: [{ type: "tool_use", id: "t3", name: "f", input: { source: { type: "url", url: "https://x" }, key: secret } }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p3 }, { cwd: tmp });
+  assert.equal(p3.messages[0].content[0].input.key, "__SECRET_K__", "tool_use.input masked even with image-like sibling");
+  assert.equal(p3.messages[0].content[0].input.source.url, "https://x", "url field untouched");
+
+  // Mistral thinking array (P0-19)
+  const p4: any = { model: "x", messages: [{ role: "assistant", content: [{ type: "thinking", thinking: [{ text: `think ${secret}` }] }, { type: "text", text: "ok" }] }] };
+  for (const h of handlers) await h({ type: "before_provider_request", payload: p4 }, { cwd: tmp });
+  assert.equal(p4.messages[0].content[0].thinking[0].text, "think __SECRET_K__", "mistral thinking array text masked");
+});

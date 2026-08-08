@@ -23,6 +23,7 @@ import {
   collectSecretsFromText,
   loadDotenvPaths,
   maskDeep,
+  maskDeepFreeform,
   registerSources,
   type MaskOptions,
 } from "../src/mask-engine.ts";
@@ -311,6 +312,18 @@ export default function (pi: any) {
           if (tc?.function && typeof tc.function.arguments === "string") {
             tc.function.arguments = maskText(tc.function.arguments);
           }
+          // OpenAI Chat custom tool call (P0-18).
+          if (tc?.custom && typeof tc.custom.input === "string") {
+            tc.custom.input = maskText(tc.custom.input);
+          }
+        }
+      }
+      // Mistral Conversations uses camelCase toolCalls (P0-9).
+      if (Array.isArray(m.toolCalls)) {
+        for (const tc of m.toolCalls) {
+          if (tc?.function && typeof tc.function.arguments === "string") {
+            tc.function.arguments = maskText(tc.function.arguments);
+          }
         }
       }
       if (m.type === "custom_tool_call" && typeof m.input === "string") {
@@ -450,13 +463,19 @@ export default function (pi: any) {
       // (P0-10/11/12): Anthropic tool_use.input, Gemini functionCall.args,
       // Bedrock toolUse.input.
       if (block.type === "tool_use" && block.input && typeof block.input === "object") {
-        maskDeep(block.input, (s) => maskText(s));
+        maskDeepFreeform(block.input, (s) => maskText(s));
       }
       if (block.functionCall && typeof block.functionCall === "object" && block.functionCall.args && typeof block.functionCall.args === "object") {
-        maskDeep(block.functionCall.args, (s) => maskText(s));
+        maskDeepFreeform(block.functionCall.args, (s) => maskText(s));
       }
       if (block.toolUse && typeof block.toolUse === "object" && block.toolUse.input && typeof block.toolUse.input === "object") {
-        maskDeep(block.toolUse.input, (s) => maskText(s));
+        maskDeepFreeform(block.toolUse.input, (s) => maskText(s));
+      }
+      // Mistral Conversations thinking is content[].thinking[].text (P0-19).
+      if (Array.isArray(block.thinking)) {
+        for (const t of block.thinking) {
+          if (t && typeof t === "object" && typeof t.text === "string") t.text = maskText(t.text);
+        }
       }
       // Reasoning content (P0-15/16): Anthropic thinking, Bedrock reasoningText.
       if (block.type === "thinking" && typeof block.thinking === "string") {
@@ -627,6 +646,7 @@ export default function (pi: any) {
               if (msg.role === "bashExecution") {
                 if (typeof msg.command === "string") msg.command = maskText(msg.command);
                 if (typeof msg.output === "string") msg.output = maskText(msg.output);
+                if (typeof msg.fullOutputPath === "string") msg.fullOutputPath = maskText(msg.fullOutputPath);
               } else if ((msg.role === "branchSummary" || msg.role === "compactionSummary") && typeof msg.summary === "string") {
                 msg.summary = maskText(msg.summary);
               }

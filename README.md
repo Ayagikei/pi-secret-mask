@@ -132,7 +132,7 @@ non-text (image) content.
 ## Development
 
 ```bash
-node --test "tests/*.test.mjs"   # masking engine unit tests
+npm test   # masking engine unit tests + mock-pi integration tests
 ```
 
 Integration-tested: three-hook closed loop, multi-placeholder rollback,
