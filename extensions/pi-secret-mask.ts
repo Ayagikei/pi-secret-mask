@@ -276,12 +276,12 @@ export default function (pi: any) {
       } else if (Array.isArray(m.parts)) {
         // Gemini contents[]: { role, parts: [...] }.
         maskBlocks(m.parts);
-      } else if ((m.type === "function_call_output" || m.type === "custom_tool_call_output") && (typeof m.output === "string" || Array.isArray(m.output))) {
+      } else if (m.type === "function_call_output" || m.type === "custom_tool_call_output") {
         // OpenAI Responses input blocks (P0-9/P0-N4): output may be a string
         // or an input_text array. Grammar-tool paths use custom_tool_call_output.
         if (typeof m.output === "string") {
           m.output = maskText(m.output);
-        } else {
+        } else if (Array.isArray(m.output)) {
           for (let i = 0; i < m.output.length; i++) {
             const item = m.output[i];
             if (item && typeof item === "object" && typeof item.text === "string") item.text = maskText(item.text);
@@ -293,6 +293,15 @@ export default function (pi: any) {
         m.arguments = maskText(m.arguments);
       } else if (m.type === "message" && Array.isArray(m.content)) {
         maskBlocks(m.content);
+      }
+      // Coding-agent message variants stored in sessions (P0-3/4/7):
+      // bashExecution.command/output, branchSummary.summary,
+      // compactionSummary.summary.
+      if (m.role === "bashExecution") {
+        if (typeof m.command === "string") m.command = maskText(m.command);
+        if (typeof m.output === "string") m.output = maskText(m.output);
+      } else if (m.role === "branchSummary" || m.role === "compactionSummary") {
+        if (typeof m.summary === "string") m.summary = maskText(m.summary);
       }
     }
   }
@@ -515,12 +524,20 @@ export default function (pi: any) {
       refreshDotenv(ctx?.cwd ?? process.cwd());
       if (Array.isArray(prep.messagesToSummarize)) maskMessages(prep.messagesToSummarize);
       if (Array.isArray(prep.turnPrefixMessages)) maskMessages(prep.turnPrefixMessages);
+      // P0-2: previous summary is fed straight into the summarizer request.
+      if (typeof prep.previousSummary === "string") {
+        prep.previousSummary = maskText(prep.previousSummary);
+      }
       // Provider-bound custom instructions may embed secrets (P0-N6). Pi
       // passes them at event level and the compaction result type offers no
       // instructions override, so if instructions contain a secret we must
       // fail closed by cancelling compaction rather than leak them.
-      if (typeof event.customInstructions === "string" && map.mask(event.customInstructions) !== event.customInstructions) {
-        return { cancel: true };
+      // Use maskText so fresh patterns are collected and "seen" is recorded.
+      if (typeof event.customInstructions === "string") {
+        const masked = maskText(event.customInstructions);
+        if (masked !== event.customInstructions) {
+          return { cancel: true };
+        }
       }
     } catch {
       // Never abort compaction.
@@ -536,17 +553,32 @@ export default function (pi: any) {
         for (const entry of prep.entriesToSummarize) {
           if (!entry) continue;
           // Real Pi structures (P0-N5): message entries carry .message.content;
-          // custom_message entries carry top-level .content.
-          let msg: any = null;
-          if (entry.type === "custom_message") msg = entry;
-          else msg = entry.message ?? entry.custom_message;
-          if (msg?.content) {
-            if (typeof msg.content === "string") {
-              msg.content = maskText(msg.content);
-            } else if (Array.isArray(msg.content)) {
-              maskBlocks(msg.content);
-            } else if (Array.isArray(msg.content?.parts)) {
-              maskBlocks(msg.content.parts);
+          // custom_message entries carry top-level .content; branch_summary and
+          // compaction entries carry .summary (P0-5/P0-6).
+          if (entry.type === "custom_message") {
+            if (typeof entry.content === "string") entry.content = maskText(entry.content);
+            else if (Array.isArray(entry.content)) maskBlocks(entry.content);
+          } else if (entry.type === "branch_summary" || entry.type === "compaction") {
+            if (typeof entry.summary === "string") entry.summary = maskText(entry.summary);
+          } else {
+            const msg = entry.message;
+            if (msg?.content) {
+              if (typeof msg.content === "string") {
+                msg.content = maskText(msg.content);
+              } else if (Array.isArray(msg.content)) {
+                maskBlocks(msg.content);
+              } else if (Array.isArray(msg.content?.parts)) {
+                maskBlocks(msg.content.parts);
+              }
+            }
+            // bashExecution/branchSummary message variants inside entries.
+            if (msg && typeof msg === "object") {
+              if (msg.role === "bashExecution") {
+                if (typeof msg.command === "string") msg.command = maskText(msg.command);
+                if (typeof msg.output === "string") msg.output = maskText(msg.output);
+              } else if ((msg.role === "branchSummary" || msg.role === "compactionSummary") && typeof msg.summary === "string") {
+                msg.summary = maskText(msg.summary);
+              }
             }
           }
         }

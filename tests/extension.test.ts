@@ -381,3 +381,79 @@ test("extension: compact hook cancels when customInstructions contain secrets", 
   }
   assert.equal(result?.cancel, true, "secret-bearing instructions cancel compaction");
 });
+
+test("extension: compact masks previousSummary and message variants; fresh pattern cancels", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=compactvar_secret123456\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const compactHandlers = pi.handlers.get("session_before_compact")!;
+  const bpHandlers = pi.handlers.get("before_provider_request")!;
+  const secret = "compactvar_secret123456";
+  // Prime the map.
+  await bpHandlers[0]({ type: "before_provider_request", payload: { model: "x", messages: [] } }, { cwd: tmp });
+
+  const event: any = {
+    type: "session_before_compact",
+    preparation: {
+      messagesToSummarize: [
+        { role: "bashExecution", command: `echo ${secret}`, output: secret, exitCode: 0, cancelled: false, truncated: false, timestamp: 1 },
+        { role: "branchSummary", summary: `branch ${secret}`, fromId: "b1", timestamp: 1 },
+        { role: "compactionSummary", summary: `comp ${secret}`, tokensBefore: 1, timestamp: 1 },
+      ],
+      turnPrefixMessages: [],
+      previousSummary: `prev ${secret}`,
+    },
+    customInstructions: "safe",
+  };
+  let result: any;
+  for (const h of compactHandlers) {
+    const r = await h(event, { cwd: tmp });
+    if (r !== undefined) result = r;
+  }
+  const prep = event.preparation;
+  assert.equal(prep.messagesToSummarize[0].command, `echo __SECRET_K__`, "bashExecution.command masked");
+  assert.equal(prep.messagesToSummarize[0].output, "__SECRET_K__", "bashExecution.output masked");
+  assert.equal(prep.messagesToSummarize[1].summary, `branch __SECRET_K__`, "branchSummary.summary masked");
+  assert.equal(prep.messagesToSummarize[2].summary, `comp __SECRET_K__`, "compactionSummary.summary masked");
+  assert.equal(prep.previousSummary, `prev __SECRET_K__`, "previousSummary masked");
+  assert.equal(result?.cancel, undefined, "safe instructions do not cancel");
+
+  // Fresh pattern (sk-...) in customInstructions must cancel (P0-N6 via maskText).
+  const ev2: any = { type: "session_before_compact", preparation: { messagesToSummarize: [], turnPrefixMessages: [] }, customInstructions: "focus sk-freshpattern1234567890abcd" };
+  result = undefined;
+  for (const h of compactHandlers) {
+    const r = await h(ev2, { cwd: tmp });
+    if (r !== undefined) result = r;
+  }
+  assert.equal(result?.cancel, true, "fresh-pattern instructions cancel");
+});
+
+test("extension: tree masks branch_summary and compaction entry summaries", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "K=treeentry_secret123456\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const treeHandlers = pi.handlers.get("session_before_tree")!;
+  const secret = "treeentry_secret123456";
+  // Prime the map.
+  const bpHandlers = pi.handlers.get("before_provider_request")!;
+  await bpHandlers[0]({ type: "before_provider_request", payload: { model: "x", messages: [] } }, { cwd: tmp });
+
+  const event: any = {
+    type: "session_before_tree",
+    preparation: {
+      entriesToSummarize: [
+        { type: "branch_summary", id: "b1", fromId: "x", summary: `branch ${secret}` },
+        { type: "compaction", id: "c1", summary: `comp ${secret}`, firstKeptEntryId: "k", tokensBefore: 1 },
+        { type: "message", id: "m1", message: { role: "bashExecution", command: `echo ${secret}`, output: secret, exitCode: 0, cancelled: false, truncated: false, timestamp: 1 } },
+      ],
+    },
+    signal: undefined,
+  };
+  for (const h of treeHandlers) await h(event, { cwd: tmp });
+  assert.equal(event.preparation.entriesToSummarize[0].summary, `branch __SECRET_K__`, "branch_summary.summary masked");
+  assert.equal(event.preparation.entriesToSummarize[1].summary, `comp __SECRET_K__`, "compaction.summary masked");
+  assert.equal(event.preparation.entriesToSummarize[2].message.command, `echo __SECRET_K__`, "message bashExecution.command masked");
+  assert.equal(event.preparation.entriesToSummarize[2].message.output, "__SECRET_K__", "message bashExecution.output masked");
+});
