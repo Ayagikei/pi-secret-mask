@@ -10,7 +10,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: read
+  contents: write
   id-token: write          # required for OIDC; no NPM_TOKEN at all
 
 jobs:
@@ -24,6 +24,7 @@ jobs:
           # NO registry-url: setup-node then writes a placeholder _authToken
           # that makes npm skip OIDC (ENEEDAUTH) or fail (E404)
       - name: Bump version (idempotent)
+        id: bump
         run: |
           CURRENT=$(node -p "require('./package.json').version")
           TARGET="${{ inputs.version }}"
@@ -31,7 +32,28 @@ jobs:
             # derive from tag: v1.2.3 -> 1.2.3
             TARGET="${GITHUB_REF_NAME#v}"
           fi
-          [ "$CURRENT" != "$TARGET" ] && npm version "$TARGET" --no-git-tag-version || echo "already $TARGET"
+          if [ "$CURRENT" != "$TARGET" ]; then
+            npm version "$TARGET" --no-git-tag-version
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already $TARGET"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
       - run: npm install --ignore-scripts  # devDependencies (typebox) for tests
       - run: npm test
       - run: npm publish --provenance --access public
+
+      # Keep the repo's package.json (+ lockfile) in sync with what was
+      # actually published: the bump above never commits, so without this the
+      # repo falls behind npm. Only pushes back when this run performed the
+      # bump; a local pre-bump (CURRENT == TARGET) leaves nothing to commit.
+      # [skip ci] guards against future push-triggered workflows.
+      - name: Commit version bump back to main
+        if: steps.bump.outputs.bumped == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.target }} [skip ci]"
+          git push origin HEAD:main
