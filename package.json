@@ -1,6 +1,6 @@
 {
   "name": "pi-secret-mask",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Mask secrets before they reach LLM providers: placeholders in provider payload, real values in bash/write, output masked back. \u4e2d\u6587\u6587\u6863\u89c1 README.zh-CN.md",
   "type": "module",
   "keywords": [

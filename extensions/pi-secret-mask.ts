@@ -44,6 +44,13 @@ const USER_CONFIG_FILE = join(homedir(), ".pi/agent/extensions/pi-secret-mask/co
 /** Secrets registered via /mask-secret, persisted in the user config dir. */
 const USER_SECRETS_FILE = join(homedir(), ".pi/agent/extensions/pi-secret-mask/secrets.json");
 
+const AGENT_GUIDANCE = `Secret-mask agent rules:
+- A __SECRET_*__ token shown in a tool result or returned by request_secret is a redacted alias, not proof that the literal token is on disk. The underlying value may come from .env, automatic detection, or persisted registration; absence of secrets.json does not prove it is unavailable.
+- If secret-mask produced a placeholder in this session, use it directly in bash commands and write/edit inputs. The extension restores the real value immediately before those local tools execute, and masks it again in tool output. A file read showing __SECRET_*__ is therefore a redacted view; do not replace the real value with the literal placeholder or conclude the config is invalid.
+- Never print, echo, or otherwise expose a real secret, and do not invent placeholder names. Validate an existing credential through the intended local operation using its placeholder.
+- Call request_secret only when the task genuinely needs a secret and no usable placeholder or existing local credential is available. Do not call it again for a placeholder already present. Ask only for the minimum secret name and purpose; after it returns, use the placeholder, never the real value.
+- If a placeholder is unknown or an operation reports invalid credentials, report that result or request a new secret; do not infer from masked output or search for secrets.json.`;
+
 function loadConfig(): Config {
   for (const path of [USER_CONFIG_FILE, CONFIG_FILE]) {
     try {
@@ -489,6 +496,13 @@ export default function (pi: any) {
     }
   }
 
+  // Keep the placeholder contract in the agent's system context. Tool results are
+  // intentionally redacted, so the agent otherwise cannot tell a masked file view
+  // from a literal placeholder stored on disk.
+  pi.on("before_agent_start", (event: any) => ({
+    systemPrompt: `${event.systemPrompt}\n\n${AGENT_GUIDANCE}`,
+  }));
+
   pi.on("before_provider_request", (event: any, ctx: any) => {
     try {
       refreshDotenv(ctx?.cwd ?? process.cwd());
@@ -699,9 +713,10 @@ export default function (pi: any) {
     name: "request_secret",
     label: "Request Secret",
     description: `Request a secret (API key/token/password) from the user and register it in the masking system.
-The value the user enters is masked into a placeholder; you (the agent) only see the placeholder and never touch the real value.
-Use the placeholder in bash commands or file writes and the extension substitutes the real value automatically.
-Use case: tasks that require a secret from the user to continue.`,
+Use this only when the task needs a secret and no usable placeholder or existing local credential is available; do not request one again for a placeholder already present.
+The value the user enters is masked into a placeholder; you only see the placeholder and never touch the real value.
+Use the returned placeholder directly in bash commands and write/edit inputs; the extension substitutes the real value locally and masks tool output again.
+${AGENT_GUIDANCE}`,
     parameters: Type.Object({
       name: Type.String({ description: "Secret name, e.g. OPENAI_API_KEY, GITHUB_TOKEN" }),
       purpose: Type.Optional(Type.String({ description: "Purpose shown to the user" })),

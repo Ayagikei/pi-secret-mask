@@ -59,6 +59,25 @@ async function loadExtension(tmp: string, config?: object) {
   }
 }
 
+test("extension: explains masked views, editing, and when to request secrets", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const { pi } = await loadExtension(tmp);
+  const beforeAgentStart = pi.handlers.get("before_agent_start");
+  assert.ok(beforeAgentStart?.length, "before_agent_start handler registered");
+  const result = await beforeAgentStart![0]({ systemPrompt: "base prompt" }, {});
+  assert.match(result.systemPrompt, /redacted alias/);
+  assert.match(result.systemPrompt, /write\/edit inputs/);
+  assert.match(result.systemPrompt, /only when the task genuinely needs a secret/);
+  assert.match(result.systemPrompt, /absence of secrets\.json does not prove/);
+
+  const requestSecret = pi.tools.get("request_secret");
+  assert.ok(requestSecret, "request_secret tool registered");
+  assert.match(requestSecret.description, /do not request one again for a placeholder already present/);
+  assert.match(requestSecret.description, /write\/edit inputs/);
+});
+
 test("extension: before_provider_request masks messages + system + tools and returns payload", async (t) => {
   const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));

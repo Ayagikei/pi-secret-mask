@@ -68,10 +68,18 @@ agent only receives the placeholder:
 Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 ```
 
-Registered secrets persist in
+Secrets registered through `/mask-secret` or `request_secret` persist in
 `~/.pi/agent/extensions/pi-secret-mask/secrets.json` (mode 0600) and survive
-restarts. Use the placeholder in bash commands or file writes; the extension
-substitutes the real value automatically.
+restarts. `.env` and automatically detected secrets may not be written there;
+they can be session-only. Use the placeholder in bash commands or `write`/`edit`
+inputs; the extension substitutes the real value locally before execution.
+
+### Placeholder rules for agents
+
+- A `__SECRET_*__` token shown in tool output or returned by `request_secret` is a redacted alias, not proof that the literal token is stored on disk. A config read showing a placeholder is a masked view, not evidence that the config is invalid.
+- If secret-mask produced the placeholder in the current session, use it directly in bash, `write`, and `edit`; the extension restores the real value locally and masks tool output again. Never print the real value or write the literal placeholder to a config as a fix.
+- Do not call `request_secret` again when a usable placeholder or local credential already exists. Call it only when the task genuinely needs a secret and no usable credential is available; then keep using the returned placeholder.
+- Do not infer that a secret is missing because `secrets.json` is absent, and do not invent placeholder names. Validate through the intended local operation; request a new secret only if that operation reports invalid credentials.
 
 ## How it works
 

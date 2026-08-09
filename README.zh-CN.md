@@ -46,7 +46,7 @@ cp config.example.json ~/.pi/agent/extensions/pi-secret-mask/config.json
 ### 自动（无需配置）
 
 - 把常见格式的密钥粘贴进对话——自动检测并掩码。
-- 自动解析项目 `.env*` 文件。
+- 自动解析项目 `.env*` 文件；这些来源默认不会持久化到 `secrets.json`。
 
 ### 手动注册密钥
 
@@ -60,9 +60,17 @@ cp config.example.json ~/.pi/agent/extensions/pi-secret-mask/config.json
 Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 ```
 
-注册的密钥持久化在
+通过 `/mask-secret` 或 `request_secret` 注册的密钥持久化在
 `~/.pi/agent/extensions/pi-secret-mask/secrets.json`（权限 0600），重启保留。
-在 bash 命令或写文件时使用占位符，扩展自动替换为真实值。
+`.env` 和自动识别的密钥不一定写入这个文件；它们可能只在当前会话可用。
+在 bash 命令或 `write`/`edit` 写文件时使用占位符，扩展会在本地执行前自动替换为真实值。
+
+### 给 agent 的占位符规则
+
+- 工具输出或 `request_secret` 返回的 `__SECRET_*__` 是脱敏别名，不是磁盘中真实存储的字面量。读取配置时看到占位符，只能说明输出被掩码了，不能据此判断配置无效。
+- 已由本插件产生的 placeholder 可以直接用于 bash、`write` 和 `edit`；扩展会在本地执行前还原真实值，工具输出再掩码。不要把真实值打印出来，也不要把字面量 placeholder 写入配置来“修复”它。
+- 如果已有可用 placeholder 或本地配置，不要重复调用 `request_secret`。只有任务确实需要 secret 且没有可用凭据时才调用；调用后继续使用返回的 placeholder，不要索要或猜测真实值。
+- 不要因为找不到 `secrets.json` 就判定 secret 不存在；也不要自行发明 placeholder。验证凭据应执行实际的本地操作；若操作明确返回无效，再报告或请求新的 secret。
 
 ## 工作原理
 
