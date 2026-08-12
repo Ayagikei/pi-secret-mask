@@ -121,6 +121,17 @@ test("parseDotenv: skips empty values and invalid keys", () => {
   assert.deepEqual(entries, [{ key: "OK", value: "yes" }]);
 });
 
+test("collectSecretsFromText: OpenAI pattern ignores sk- inside ordinary words", () => {
+  const opts = {
+    extraSecrets: [],
+    customPatterns: [],
+    dotenv: { enabled: false, files: [], exclude: [] },
+    patterns: { openai: true, github: false, google: false, aws: false, jwt: false, pem: false, base64: false },
+    base64MinLength: 32,
+  };
+  assert.deepEqual(collectSecretsFromText("/tmp/task-compileKotlinJvm-shared-module.log", opts), []);
+});
+
 test("collectPatternSecrets: built-in regexes", () => {
   const opts = {
     extraSecrets: [],

@@ -68,7 +68,7 @@ function builtinPatterns(opts: MaskOptions["patterns"]): { name: string; re: Reg
   const add = (name: string, enabled: boolean, source: string, flags = "g") => {
     if (enabled) out.push({ name, re: new RegExp(source, flags) });
   };
-  add("OPENAI", opts.openai, "sk-[A-Za-z0-9_-]{20,}");
+  add("OPENAI", opts.openai, "(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{20,}");
   add("GITHUB", opts.github, "(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}");
   add("GOOGLE", opts.google, "AIza[0-9A-Za-z_-]{35}");
   add("AWS", opts.aws, "(?:AKIA|ASIA|AIDA)[0-9A-Z]{16}");
