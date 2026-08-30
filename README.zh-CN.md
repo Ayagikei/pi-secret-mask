@@ -76,7 +76,7 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 
 | 钩子 | 动作 |
 |---|---|
-| `before_provider_request` | 所有消息中：真实值 → 占位符 |
+| `before_provider_request` | 标准消息与自定义 provider 顶层 `text` 中：真实值 → 占位符 |
 | `tool_call` | bash 占位符 → 真实值（auto/ask 策略）；write/edit 内容还原 |
 | `tool_result` | 工具输出中的真实值 → 占位符（防止回流） |
 | `session_before_compact` | 压缩摘要消息同样掩码 |

@@ -110,6 +110,30 @@ test("extension: before_provider_request masks messages + system + tools and ret
   assert.equal((payload.tools[0] as any).type, "function", "structural type untouched");
 });
 
+test("extension: Cursor SDK top-level text is masked without touching images", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "CURSOR_TOKEN=cursorsecretvalue123\n");
+
+  const { pi } = await loadExtension(tmp, { mode: "auto" });
+  const handlers = pi.handlers.get("before_provider_request");
+  const payload = {
+    text: "use cursorsecretvalue123",
+    images: [{ data: "cursorsecretvalue123", mimeType: "image/png" }],
+  };
+
+  let returned: unknown;
+  for (const h of handlers) {
+    const result = await h({ type: "before_provider_request", payload }, { cwd: tmp });
+    if (result !== undefined) returned = result;
+  }
+
+  assert.strictEqual(returned, payload);
+  const result = returned as typeof payload;
+  assert.equal(result.text, "use __SECRET_CURSOR_TOKEN__");
+  assert.deepEqual(result.images, [{ data: "cursorsecretvalue123", mimeType: "image/png" }]);
+});
+
 test("extension: Gemini contents[].parts[].text and config.systemInstruction are masked", async (t) => {
   const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));

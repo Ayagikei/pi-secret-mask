@@ -85,7 +85,7 @@ inputs; the extension substitutes the real value locally before execution.
 
 | Hook | Action |
 |---|---|
-| `before_provider_request` | Real values -> placeholders across all messages |
+| `before_provider_request` | Real values -> placeholders across standard message payloads and custom-provider top-level `text` payloads |
 | `tool_call` | bash placeholders -> real values (auto/ask policy); write/edit content unmasked |
 | `tool_result` | Real values in tool output -> placeholders (prevents reflow) |
 | `session_before_compact` | Summary messages masked too |

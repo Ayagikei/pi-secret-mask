@@ -2,7 +2,7 @@
  * pi-secret-mask extension entry point.
  *
  * Prevents secrets from leaking to LLM providers:
- * - before_provider_request: real values -> placeholders across all messages
+ * - before_provider_request: real values -> placeholders across model-facing text payloads
  * - tool_call: bash command placeholders -> real values (auto/ask policy)
  * - tool_result: real values in tool output -> placeholders (prevents reflow)
  * - session_before_compact / session_before_tree: summary messages masked too
@@ -380,13 +380,13 @@ export default function (pi: any) {
   }
 
   /**
-   * Mask any provider payload shape (messages/input/contents/system + string
-   * content). Only known text paths are scanned: sweeping the whole payload
-   * would corrupt structural fields (role/type/name) when a short .env value
-   * collides with them (P1-N1).
+   * Mask known provider text paths (`text`, messages/input/contents/system, and
+   * string content). Sweeping the whole payload would corrupt structural fields
+   * (role/type/name) when a short .env value collides with them (P1-N1).
    */
   function maskPayload(payload: any): void {
     if (payload == null) return;
+    if (typeof payload.text === "string") payload.text = maskText(payload.text);
     // System prompt can be a string (Anthropic/Bedrock), a block array, or
     // Gemini's config.systemInstruction; Codex Responses uses top-level
     // instructions (P0-10).
