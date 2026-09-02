@@ -5,6 +5,7 @@ import {
   collectPatternSecrets,
   collectSecretsFromText,
   maskDeep,
+  maskDeepFreeform,
   parseDotenv,
   pruneSecrets,
   registerSources,
@@ -325,4 +326,26 @@ test("parseDotenv: escaped quote right before closing quote (off-by-one)", () =>
   const entries = parseDotenv('A="x\\q"');
   assert.equal(entries.length, 1);
   assert.equal(entries[0].value, "xq"); // escaped q, closing quote consumed
+});
+
+test("MaskMap: explicit raw placeholder-shaped input receives a distinct handle", () => {
+  const m = new MaskMap();
+  const raw = "__" + "SECRET_TOKEN__";
+  const handle = m.addRaw(raw, "TOKEN");
+  assert.notEqual(handle, raw);
+  assert.equal(m.secretFor(handle), raw);
+  assert.equal(m.mask(`value=${raw}`), `value=${handle}`);
+  assert.equal(m.unmask(handle), raw);
+});
+
+test("maskDeepFreeform preserves both values across chained key renames", () => {
+  const m = new MaskMap();
+  const firstRaw = "__" + "SECRET_A__";
+  const firstHandle = m.addRaw(firstRaw, "A");
+  const secondRaw = firstHandle;
+  const secondHandle = m.addRaw(secondRaw, "A_2");
+  const value = { [firstRaw]: "first", [secondRaw]: "second" };
+
+  assert.equal(maskDeepFreeform(value, (text) => m.mask(text)), true);
+  assert.deepEqual(value, { [firstHandle]: "first", [secondHandle]: "second" });
 });
