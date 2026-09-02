@@ -16,11 +16,12 @@ where secrets never enter provider requests or leak back through tool output.
   private keys, custom regexes) are detected and masked automatically.
 - **`.env` support**: parses project `.env*` files (`KEY=VALUE`), refreshes
   incrementally when they change mid-session.
-- **User-registered secrets**: `/mask-secret` command and `request_secret`
-  tool let a user register a secret; the agent only ever sees the placeholder.
-- **Real values where they matter**: bash commands, `write`, and `edit`
-  automatically substitute placeholders back to real values (files store real
-  values; brand-new values are unaffected).
+- **Masked local capture**: bare `/mask-secret` and `request_secret` use a
+  bullet-only TUI field; the agent only ever sees an opaque handle. Plaintext
+  command arguments remain compatible but warn locally.
+- **Policy-scoped resolution**: real values are resolved only at authorized
+  tool paths and, unless `mode: "auto"` or a Bash `allowCommands` rule applies,
+  only after local confirmation.
 - **Compaction-safe**: summary messages in compaction and tree navigation are
   masked too.
 
@@ -71,8 +72,8 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 Secrets registered through `/mask-secret` or `request_secret` persist in
 `~/.pi/agent/extensions/pi-secret-mask/secrets.json` (mode 0600) and survive
 restarts. `.env` and automatically detected secrets may not be written there;
-they can be session-only. Use the placeholder in bash commands or `write`/`edit`
-inputs; the extension substitutes the real value locally before execution.
+they can be session-only. Reusing a persisted named credential requires a local
+TUI confirmation before its handle is returned; non-TUI modes fail closed.
 
 ### Placeholder rules for agents
 
@@ -86,7 +87,7 @@ inputs; the extension substitutes the real value locally before execution.
 | Hook | Action |
 |---|---|
 | `before_provider_request` | Real values -> placeholders across standard message payloads and custom-provider top-level `text` payloads |
-| `tool_call` | bash placeholders -> real values (auto/ask policy); write/edit content unmasked |
+| `tool_call` | Resolve explicit handles only at policy-authorized paths after local confirmation |
 | `tool_result` | Real values in tool output -> placeholders (prevents reflow) |
 | `session_before_compact` | Summary messages masked too |
 | `session_before_tree` | Branch/tree summary messages masked too |
@@ -105,7 +106,8 @@ non-text (image) content.
   "dotenv": { "enabled": true, "files": [".env", ".env.local", ".env.production", ".env.development"], "exclude": [".env.example", ".env.sample"] },
   "patterns": { "openai": true, "github": true, "google": true, "aws": true, "jwt": true, "pem": true, "base64": false },
   "extraSecrets": [],
-  "customPatterns": []
+  "customPatterns": [],
+  "toolResolution": { "enabled": true, "includeDefaults": true, "rules": [] }
 }
 ```
 
@@ -117,6 +119,15 @@ non-text (image) content.
   still passes)
 - `customPatterns`: custom regexes; capture group 1 is the full secret value;
   invalid regexes are ignored
+- `toolResolution`: defaults authorize only `bash.command`,
+  `powershell.command`, `write.content`, legacy `edit.oldText`/`newText`,
+  current `edit.edits.*.oldText`/`newText`, and Pi MCP Adapter `mcp.args`.
+  `mcp.args` may be an object or a JSON string containing an argument object;
+  handle-bearing keys and invalid JSON are blocked. The reusable JSON adapter
+  also supports schemas whose authorized field accepts an array. Browser, direct `mcp__*`,
+  and other custom tools require explicit `rules` entries (`tool`, `paths`,
+  optional `adapter: "json"`). Unknown handles and unauthorized paths always
+  fail closed.
 
 ```json
 {
