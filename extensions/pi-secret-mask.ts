@@ -175,6 +175,83 @@ export default function (pi: any) {
   // Secrets registered via /mask-secret (only these are persisted).
   const userSecrets = new Map<string, string>(); // name -> value
 
+  // Local capability grants: never persist or reconstruct from conversation history.
+  // Bind to both the session and the value, since handles may be reused on rotation.
+  const sessionApprovals = new Map<string, string>(); // handle -> approved value
+  let approvalSessionId: string | undefined;
+  let approvalEpoch = 0;
+  let sessionClosed = false;
+
+  function sessionId(ctx: any): string | undefined {
+    try {
+      const id = ctx?.sessionManager?.getSessionId?.();
+      return typeof id === "string" && id.length > 0 ? id : undefined;
+    } catch {
+      return undefined; // Stale or unavailable session context: never remember grants.
+    }
+  }
+
+  function clearSessionApprovals(): void {
+    sessionApprovals.clear();
+    approvalEpoch++;
+  }
+
+  function invalidateHandleApproval(handle: string | undefined): void {
+    if (handle === undefined) return;
+    sessionApprovals.delete(handle);
+    approvalEpoch++; // Also invalidate pending confirmations that captured this value.
+  }
+
+  /** A check retained across await boundaries; late UI replies cannot revive grants. */
+  function approvalGuard(ctx: any, handles: string[], signal?: AbortSignal): () => boolean {
+    const id = sessionId(ctx);
+    if (id !== approvalSessionId) {
+      clearSessionApprovals();
+      approvalSessionId = id;
+    }
+    const epoch = approvalEpoch;
+    const values = handles.map((handle) => [handle, map.secretFor(handle)] as const);
+    return () => !sessionClosed && epoch === approvalEpoch && sessionId(ctx) === id &&
+      !signal?.aborted && !ctx?.signal?.aborted &&
+      values.every(([handle, value]) => value !== undefined && map.secretFor(handle) === value);
+  }
+
+  /** Return a guard, not just a boolean: the caller must recheck before exposing/applying a handle. */
+  async function approveHandles(
+    ctx: any, handles: string[], title: string, message: string,
+    policyApproved = false, signal?: AbortSignal,
+  ): Promise<(() => boolean) | undefined> {
+    const current = approvalGuard(ctx, handles, signal);
+    if (!current()) return undefined;
+    const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.select || ctx?.ui?.confirm);
+    const canRemember = hasUI && ctx?.mode === "tui" && approvalSessionId !== undefined;
+    if (policyApproved || (canRemember && handles.every((handle) =>
+      sessionApprovals.has(handle) && sessionApprovals.get(handle) === map.secretFor(handle)))) {
+      return current;
+    }
+    if (!hasUI) return undefined;
+
+    if (ctx?.mode === "tui" && typeof ctx?.ui?.select === "function") {
+      const choices = ["Allow once", ...(canRemember ? ["Allow for this session"] : []), "Deny"];
+      const scope = canRemember
+        ? "\n\nSession allowance covers reuse and use of these credentials at ANY configured tool path, not just this call. It ends on session change or /reload. Revoke with /mask-secret-revoke."
+        : "";
+      const choice = await ctx.ui.select(`${title}\n\n${message}${scope}`, choices, { signal: signal ?? ctx?.signal });
+      if (!current()) return undefined;
+      if (choice === "Allow for this session" && canRemember) {
+        for (const handle of handles) sessionApprovals.set(handle, map.secretFor(handle)!);
+        ctx?.ui?.notify?.("Credentials allowed for this session. Revoke with /mask-secret-revoke.", "info");
+        return current;
+      }
+      return choice === "Allow once" ? current : undefined;
+    }
+
+    // Older UI hosts and RPC retain one-shot confirmation only; never silently escalate it.
+    const approved = typeof ctx?.ui?.confirm === "function" &&
+      await ctx.ui.confirm(title, message, { signal: signal ?? ctx?.signal });
+    return approved === true && current() ? current : undefined;
+  }
+
   // Extra secrets from config.
   for (const { name, value } of options.extraSecrets) {
     if (value) {
@@ -234,6 +311,7 @@ export default function (pi: any) {
     set.delete(source);
     if (set.size === 0) {
       secretSources.delete(secret);
+      invalidateHandleApproval(map.placeholderFor(secret));
       map.remove(secret);
     }
   }
@@ -242,6 +320,7 @@ export default function (pi: any) {
   function registerUserSecret(name: string, value: string): string {
     const prev = userSecrets.get(name);
     if (prev !== undefined && prev !== value) {
+      invalidateHandleApproval(map.placeholderFor(prev));
       // Old value keeps other sources (dotenv/extra/regex/seen) but loses "user".
       dropSource(prev, `user:${name}`);
     }
@@ -552,6 +631,16 @@ export default function (pi: any) {
     );
   }
 
+  pi.on("session_start", (_event: any, ctx: any) => {
+    clearSessionApprovals();
+    approvalSessionId = sessionId(ctx);
+    sessionClosed = false;
+  });
+  pi.on("session_shutdown", () => {
+    clearSessionApprovals();
+    sessionClosed = true;
+  });
+
   // Keep the placeholder contract in the agent's system context. Tool results are
   // intentionally redacted, so the agent otherwise cannot tell a masked file view
   // from a literal placeholder stored on disk.
@@ -598,16 +687,12 @@ export default function (pi: any) {
         try { return command.startsWith(pattern) || new RegExp(pattern).test(command); } catch { return false; }
       });
     }
-    if (!approved) {
-      const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
-      approved = hasUI && typeof ctx?.ui?.confirm === "function"
-        ? await ctx.ui.confirm(
-          "Use protected secret?",
-          `Tool: ${event.toolName}\nHandles: ${plan.handles.join(", ")}\nAuthorized argument paths: ${plan.paths.join(", ")}\n\nOnly handles are displayed; real values are not rendered.`,
-        )
-        : false;
-    }
-    if (!approved) return { block: true, reason: "Blocked by secret-mask: user declined secret-handle use" };
+    const permission = await approveHandles(
+      ctx, plan.handles, "Use protected secret?",
+      `Tool: ${event.toolName}\nHandles: ${plan.handles.join(", ")}\nAuthorized argument paths: ${plan.paths.join(", ")}\n\nOnly handles are displayed; real values are not rendered.`,
+      approved,
+    );
+    if (!permission?.()) return { block: true, reason: "Blocked by secret-mask: secret-handle approval declined, cancelled, or expired" };
     plan.apply();
   });
 
@@ -720,6 +805,14 @@ export default function (pi: any) {
     return clean || "USER";
   };
 
+  pi.registerCommand("mask-secret-revoke", {
+    description: "Revoke all session-only secret approvals (keeps saved credentials and configured policy)",
+    handler: async (_args: string, ctx: any) => {
+      clearSessionApprovals();
+      ctx?.ui?.notify?.("Session secret approvals revoked. Saved credentials and mode/allowCommands policy are unchanged.", "info");
+    },
+  });
+
   // Upstream-compatible command forms: one argument is the plaintext value
   // under USER; NAME VALUE remains supported. No-argument capture is TUI-only.
   pi.registerCommand("mask-secret", {
@@ -751,6 +844,7 @@ export default function (pi: any) {
   pi.registerTool({
     name: "request_secret",
     label: "Request Secret",
+    executionMode: "sequential", // Local input dialogs must not overlap sibling requests.
     description: `Request an API key, token, username, or password through a local masked TUI prompt.
 The real value never appears in the tool result or conversation; this tool returns an opaque __SECRET_*__ handle.
 Use this only when the task needs a credential; do not request one again for a placeholder already present.
@@ -763,7 +857,7 @@ ${AGENT_GUIDANCE}`,
     execute: async (
       _id: string,
       params: { name: string; purpose?: string },
-      _signal: unknown,
+      signal: AbortSignal | undefined,
       _onUpdate: unknown,
       ctx: any,
     ) => {
@@ -771,23 +865,29 @@ ${AGENT_GUIDANCE}`,
       const existing = userSecrets.get(name);
       if (existing !== undefined) {
         // Reusing a persisted local credential is a capability grant too.
-        if (ctx?.mode !== "tui" || typeof ctx?.ui?.confirm !== "function") {
+        if (ctx?.mode !== "tui") {
           return { content: [{ type: "text" as const, text: "A local credential may exist, but secure confirmation is unavailable in this mode." }] };
         }
-        const approved = await ctx.ui.confirm(
-          "Reuse protected credential?",
-          `Reuse the locally registered credential ${name}? Only its handle will be returned.`,
-        );
-        if (!approved) return { content: [{ type: "text" as const, text: `User declined reuse of ${name}.` }] };
         const handle = map.placeholderFor(existing);
         if (!handle) return { content: [{ type: "text" as const, text: `Credential ${name} is unavailable.` }] };
+        const permission = await approveHandles(
+          ctx, [handle], "Reuse protected credential?",
+          `Reuse the locally registered credential ${name}? Only its handle ${handle} will be returned.`,
+          false, signal,
+        );
+        if (!permission?.() || userSecrets.get(name) !== existing) {
+          return { content: [{ type: "text" as const, text: `Reuse of ${name} declined, cancelled, or approval expired.` }] };
+        }
         return {
           content: [{ type: "text" as const, text: `Credential ${name} is available. Reuse handle ${handle}.` }],
           details: { name, handle, reused: true },
         };
       }
 
+      const current = approvalGuard(ctx, [], signal);
+      if (!current()) return { content: [{ type: "text" as const, text: "Secret request cancelled or session closed." }] };
       const value = await secureInput(ctx, name, params.purpose);
+      if (!current()) return { content: [{ type: "text" as const, text: "Secret request cancelled or session changed." }] };
       if (value === undefined) {
         return {
           content: [{ type: "text" as const, text: ctx?.mode === "tui" ? `User declined to provide ${name}.` : "Secure masked input is unavailable outside TUI mode." }],
