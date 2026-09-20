@@ -58,7 +58,7 @@ const AGENT_GUIDANCE = `Secret-mask agent rules:
 - A __SECRET_*__ token shown in a tool result or returned by request_secret is a redacted alias, not proof that the literal token is on disk. The underlying value may come from .env, automatic detection, or persisted registration; absence of secrets.json does not prove it is unavailable.
 - If secret-mask produced a placeholder in this session, use it directly in bash commands and write/edit inputs. The extension restores the real value immediately before those local tools execute, and masks it again in tool output. A file read showing __SECRET_*__ is therefore a redacted view; do not replace the real value with the literal placeholder or conclude the config is invalid.
 - Never print, echo, or otherwise expose a real secret, and do not invent placeholder names. Validate an existing credential through the intended local operation using its placeholder.
-- Call request_secret only when the task genuinely needs a secret and no usable placeholder or existing local credential is available. Do not call it again for a placeholder already present. Ask only for the minimum secret name and purpose; after it returns, use the placeholder, never the real value.
+- Call request_secret only when the task genuinely needs a secret and no usable placeholder or existing local credential is available. Do not call it again for a placeholder already present unless the user requests replacement or the credential is confirmed invalid; use replace: true with its registered name to update it through masked input. Ask only for the minimum secret name and purpose; after it returns, use the placeholder, never the real value.
 - If a placeholder is unknown or an operation reports invalid credentials, report that result or request a new secret; do not infer from masked output or search for secrets.json.`;
 
 // These names carry content-block structure rather than user data. Key-only
@@ -847,23 +847,28 @@ export default function (pi: any) {
     executionMode: "sequential", // Local input dialogs must not overlap sibling requests.
     description: `Request an API key, token, username, or password through a local masked TUI prompt.
 The real value never appears in the tool result or conversation; this tool returns an opaque __SECRET_*__ handle.
-Use this only when the task needs a credential; do not request one again for a placeholder already present.
+Use this only when the task needs a credential; do not request one again for a placeholder already present unless replacement is needed. Set replace: true to update an existing registered name through fresh masked input (never supply the value in tool arguments).
 Use that returned handle explicitly only in an authorized tool argument. Built-in authorization covers bash.command, powershell.command, write.content, edit old/new text (including edits arrays), and Pi MCP Adapter mcp.args object or JSON containers. Browser, direct MCP, and custom tools require configured toolResolution rules.
 ${AGENT_GUIDANCE}`,
     parameters: Type.Object({
       name: Type.String({ description: "Credential name, e.g. OPENAI_API_KEY or GITHUB_TOKEN" }),
       purpose: Type.Optional(Type.String({ description: "Short reason shown in the local prompt" })),
+      replace: Type.Optional(Type.Boolean({ description: "Replace an existing locally registered credential via fresh masked TUI input; defaults to false. Unknown names are not created in replacement mode." })),
     }),
     execute: async (
       _id: string,
-      params: { name: string; purpose?: string },
+      params: { name: string; purpose?: string; replace?: boolean },
       signal: AbortSignal | undefined,
       _onUpdate: unknown,
       ctx: any,
     ) => {
       const name = safeCredentialName(params.name);
       const existing = userSecrets.get(name);
-      if (existing !== undefined) {
+      const replacing = params.replace === true;
+      if (replacing && existing === undefined) {
+        return { content: [{ type: "text" as const, text: `No locally registered credential named ${name}. Use request_secret without replace to register it; environment/config credentials must be updated at their source.` }], details: { name, updated: false } };
+      }
+      if (existing !== undefined && !replacing) {
         // Reusing a persisted local credential is a capability grant too.
         if (ctx?.mode !== "tui") {
           return { content: [{ type: "text" as const, text: "A local credential may exist, but secure confirmation is unavailable in this mode." }] };
@@ -886,8 +891,10 @@ ${AGENT_GUIDANCE}`,
 
       const current = approvalGuard(ctx, [], signal);
       if (!current()) return { content: [{ type: "text" as const, text: "Secret request cancelled or session closed." }] };
-      const value = await secureInput(ctx, name, params.purpose);
-      if (!current()) return { content: [{ type: "text" as const, text: "Secret request cancelled or session changed." }] };
+      const value = await secureInput(ctx, name, replacing
+        ? `Replace the saved credential. Cancel keeps the existing value.${params.purpose ? ` Reason: ${params.purpose}` : ""}`
+        : params.purpose);
+      if (!current() || userSecrets.get(name) !== existing) return { content: [{ type: "text" as const, text: "Secret request cancelled or session/credential changed; no value saved." }] };
       if (value === undefined) {
         return {
           content: [{ type: "text" as const, text: ctx?.mode === "tui" ? `User declined to provide ${name}.` : "Secure masked input is unavailable outside TUI mode." }],
@@ -896,8 +903,8 @@ ${AGENT_GUIDANCE}`,
       }
       const ph = registerUserSecret(name, value);
       return {
-        content: [{ type: "text" as const, text: `Registered ${name}. Use handle ${ph} explicitly in an authorized tool argument. The real value was not exposed.` }],
-        details: { name, handle: ph },
+        content: [{ type: "text" as const, text: `${replacing ? "Updated" : "Registered"} ${name}. Use handle ${ph} explicitly in an authorized tool argument. The real value was not exposed.` }],
+        details: { name, handle: ph, ...(replacing ? { updated: true } : {}) },
       };
     },
   });

@@ -68,6 +68,16 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 重用已持久化的具名凭据时，必须先在本地 TUI 授权才会返回其 handle；
 当前 session 已授权的凭据不再重复询问，非 TUI 模式仍安全地拒绝。
 
+### 更新已保存的凭据
+
+调用 `request_secret({ name: "GITHUB_TOKEN", replace: true, purpose: "更换过期 token" })`。
+即使已有会话授权，替换仍须重新通过 TUI 掩码输入；工具参数不接收明文值。
+取消、非 TUI 模式或会话失效不会改变已保存的凭据。值发生变化时会撤销旧值的
+会话授权。后续使用返回的 handle，不要假定 handle 保持不变。
+
+省略 `replace` 时仍按原逻辑复用。替换要求名称已在本地注册，不会修改 `.env`
+或配置文件中的凭据。
+
 ### 本 session 内不再询问
 
 在 TUI 的凭据复用、工具使用确认框中，可以选择：

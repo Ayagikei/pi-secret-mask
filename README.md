@@ -77,6 +77,18 @@ they can be session-only. Reusing a persisted named credential requires a local
 TUI approval before its handle is returned, unless that credential is already
 approved for this session; non-TUI modes fail closed.
 
+### Updating a saved credential
+
+Call `request_secret({ name: "GITHUB_TOKEN", replace: true, purpose: "Rotate expired token" })`.
+Replacement always opens fresh masked TUI input, even with session approval;
+no plaintext value is accepted in the tool arguments. Cancellation, non-TUI
+execution, or a stale session leaves the saved credential unchanged. A changed
+value invalidates its old session approval. Use the returned handle afterward;
+do not assume it stays the same.
+
+Without `replace`, existing credentials are reused as before. Replacement requires
+an existing locally registered name; it does not edit `.env` or config secrets.
+
 ### Session-only approvals
 
 In the TUI, credential reuse and protected tool-use dialogs offer:

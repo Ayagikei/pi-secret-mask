@@ -59,6 +59,10 @@ function fixture(config = {}) {
   };
 }
 
+function replace(f, name = "APP_TOKEN", signal) {
+  return f.pi.tools.get("request_secret").execute("update", { name, replace: true }, signal, undefined, f.ctx);
+}
+
 async function grant(f) {
   f.choices.push(SESSION);
   assert.equal((await f.reuse()).details.handle, A);
@@ -377,6 +381,44 @@ test("late masked input after shutdown is not registered or persisted", async ()
   assert.equal((await pending).details?.handle, undefined);
   assert.equal(readFileSync(join(dir, "secrets.json"), "utf8"), saved);
 });
+
+test("explicit replacement persists a new value, returns only a handle, and revokes approval", async () => {
+  const f = fixture();
+  await grant(f);
+  f.ctx.ui.custom = async () => "replacement-secret-987654";
+  const result = await replace(f);
+  assert.equal(result.details.updated, true);
+  assert.doesNotMatch(JSON.stringify(result), /replacement-secret-987654|app-secret-123456/);
+  const saved = JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8"));
+  assert.equal(saved.find((s) => s.name === "APP_TOKEN").value, "replacement-secret-987654");
+  assert.equal((await f.use("write", { content: result.details.handle })).result.block, true);
+  f.choices.push(ONCE);
+  assert.equal((await f.use("write", { content: result.details.handle })).input.content, "replacement-secret-987654");
+});
+
+for (const condition of ["cancel", "rpc", "print", "json", "abort", "shutdown", "revoke", "rotate", "missing"]) {
+  test(`replacement preserves saved values on ${condition}`, async () => {
+    const f = fixture();
+    const controller = new AbortController();
+    let saved = readFileSync(join(dir, "secrets.json"), "utf8");
+    f.ctx.ui.custom = async () => {
+      if (condition === "cancel") return undefined;
+      if (condition === "abort") controller.abort();
+      if (condition === "shutdown") f.pi.handlers.get("session_shutdown")({}, f.ctx);
+      if (condition === "revoke") await f.revoke();
+      if (condition === "rotate") {
+        await f.pi.commands.get("mask-secret").handler("APP_TOKEN concurrent-secret-123456", f.ctx);
+        saved = readFileSync(join(dir, "secrets.json"), "utf8");
+      }
+      if (condition === "missing") assert.fail("unknown names must not prompt");
+      return "replacement-secret-987654";
+    };
+    if (["rpc", "print", "json"].includes(condition)) f.ctx.mode = condition;
+    const result = await replace(f, condition === "missing" ? "MISSING" : "APP_TOKEN", controller.signal);
+    assert.equal(result.details?.handle, undefined);
+    assert.equal(readFileSync(join(dir, "secrets.json"), "utf8"), saved);
+  });
+}
 
 test("fresh masked capture does not implicitly grant session use", async () => {
   const f = fixture();
