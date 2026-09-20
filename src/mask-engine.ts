@@ -200,15 +200,28 @@ export class MaskMap {
   /** Secrets sorted by length descending (for alternation construction). */
   private sortedSecrets: string[] = [];
 
-  /** Register a secret. Placeholders are globally unique. Returns the placeholder. */
+  /** Register provider/detected text. Existing placeholders are deliberately not re-registered. */
   add(secret: string, baseName: string): string {
+    if (PLACEHOLDER_RE.test(secret)) return secret;
+    return this.addMapped(secret, baseName);
+  }
+
+  /**
+   * Register a value obtained from an explicit local secret input. Unlike add(),
+   * this treats placeholder-shaped input as raw data and always gives it a
+   * distinct handle, so it can never be returned verbatim to the model.
+   */
+  addRaw(secret: string, baseName: string): string {
+    return this.addMapped(secret, baseName);
+  }
+
+  private addMapped(secret: string, baseName: string): string {
     const existing = this.secretToPlaceholder.get(secret);
     if (existing) return existing;
-    if (PLACEHOLDER_RE.test(secret)) return secret; // never re-register placeholders
     const name = sanitizeName(baseName);
     let placeholder = `__SECRET_${name}__`;
     let n = 1;
-    while (this.usedPlaceholders.has(placeholder)) {
+    while (this.usedPlaceholders.has(placeholder) || placeholder === secret) {
       n++;
       placeholder = `__SECRET_${name}_${n}__`;
     }
@@ -302,34 +315,113 @@ export function maskDeepFreeform(value: unknown, fn: (text: string) => string): 
           value[i] = next;
           changed = true;
         }
-      } else if (item && typeof item === "object") {
+      } else if (item && typeof item === "object" && !isFreeformBinaryNode(item as Record<string, unknown>)) {
         changed = maskDeepFreeform(item, fn) || changed;
       }
     }
     return changed;
   }
   if (value && typeof value === "object") {
+    if (isFreeformBinaryNode(value as Record<string, unknown>)) return false;
+    const object = value as Record<string, unknown>;
     let changed = false;
-    for (const key of Object.keys(value as Record<string, unknown>)) {
-      // Skip binary payload fields only.
-      if (key === "data" || key === "bytes" || key === "image" || key === "inlineData") {
-        const v = (value as Record<string, unknown>)[key];
-        if (typeof v === "string" || v === null) continue;
-      }
-      const item = (value as Record<string, unknown>)[key];
-      if (typeof item === "string") {
-        const next = fn(item);
-        if (next !== item) {
-          (value as Record<string, unknown>)[key] = next;
-          changed = true;
+    for (const key of Object.keys(object)) {
+      const item = object[key];
+      // `bytes` is always binary. A field merely named `data` is ordinary
+      // textual data unless the enclosing object is an actual image node.
+      if (key !== "bytes" || (typeof item !== "string" && item !== null)) {
+        if (typeof item === "string") {
+          const next = fn(item);
+          if (next !== item) {
+            object[key] = next;
+            changed = true;
+          }
+        } else if (item && typeof item === "object" && !isFreeformBinaryNode(item as Record<string, unknown>)) {
+          changed = maskDeepFreeform(item, fn) || changed;
         }
-      } else if (item && typeof item === "object") {
-        changed = maskDeepFreeform(item, fn) || changed;
+      }
+    }
+    return renameMaskedOwnKeys(object, fn) || changed;
+  }
+  return false;
+}
+
+/**
+ * Mask keys in free-form objects without rewriting string values. This is used
+ * after schema-aware content-block masking so structural fields stay intact.
+ */
+export function maskDeepFreeformKeys(
+  value: unknown,
+  fn: (text: string) => string,
+  protectedKeys: ReadonlySet<string> = new Set<string>(),
+): boolean {
+  if (Array.isArray(value)) {
+    let changed = false;
+    for (const item of value) {
+      if (item && typeof item === "object" && !isFreeformBinaryNode(item as Record<string, unknown>)) {
+        changed = maskDeepFreeformKeys(item, fn, protectedKeys) || changed;
       }
     }
     return changed;
   }
+  if (value && typeof value === "object") {
+    if (isFreeformBinaryNode(value as Record<string, unknown>)) return false;
+    const object = value as Record<string, unknown>;
+    let changed = false;
+    for (const item of Object.values(object)) {
+      if (item && typeof item === "object" && !isFreeformBinaryNode(item as Record<string, unknown>)) {
+        changed = maskDeepFreeformKeys(item, fn, protectedKeys) || changed;
+      }
+    }
+    return renameMaskedOwnKeys(object, fn, protectedKeys) || changed;
+  }
   return false;
+}
+
+/** Rename all source keys from a stable snapshot before defining destinations. */
+function renameMaskedOwnKeys(
+  object: Record<string, unknown>,
+  fn: (text: string) => string,
+  protectedKeys: ReadonlySet<string> = new Set<string>(),
+): boolean {
+  const renamed = Object.keys(object)
+    .filter((key) => !protectedKeys.has(key))
+    .map((key) => ({ key, nextKey: fn(key), item: object[key] }))
+    .filter(({ key, nextKey }) => nextKey !== key);
+  if (renamed.length === 0) return false;
+
+  // Delete every source first. Applying chained renames sequentially (A -> B,
+  // B -> C) would otherwise delete the value already moved into B.
+  for (const { key } of renamed) delete object[key];
+  const occupied = new Set(Object.keys(object));
+
+  for (const { nextKey, item } of renamed) {
+    let destination = nextKey;
+    if (occupied.has(destination)) {
+      // Preserve all data without retaining the secret-bearing key. This alias
+      // is used only when two source keys mask to the same destination or a
+      // destination is already occupied by an unchanged key.
+      let suffix = 2;
+      destination = `__MASKED_SECRET_KEY_${suffix}__`;
+      while (occupied.has(destination)) destination = `__MASKED_SECRET_KEY_${++suffix}__`;
+    }
+    // Defining an own property also preserves a literal JSON "__proto__" key
+    // without invoking Object.prototype's legacy setter.
+    Object.defineProperty(object, destination, {
+      value: item,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    occupied.add(destination);
+  }
+  return true;
+}
+
+/** Free-form tool JSON only skips actual image/binary nodes, not source siblings. */
+function isFreeformBinaryNode(v: Record<string, unknown>): boolean {
+  return v.type === "image" || v.type === "input_image" || v.type === "image_url" ||
+    (typeof v.inlineData === "object" && v.inlineData !== null);
 }
 
 /**

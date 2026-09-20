@@ -37,7 +37,8 @@
     "typebox": "*"
   },
   "scripts": {
-    "test": "node --test \"tests/*.test.mjs\" \"tests/extension.test.ts\""
+    "test": "node --experimental-strip-types --test \"tests/*.test.mjs\" \"tests/extension.test.ts\"",
+    "check:syntax": "node --experimental-strip-types --check extensions/pi-secret-mask.ts && node --experimental-strip-types --check src/mask-engine.ts && node --experimental-strip-types --check src/masked-secret-input.ts && node --experimental-strip-types --check src/secret-input-buffer.ts && node --experimental-strip-types --check src/tool-secret-resolver.ts"
   },
   "devDependencies": {
     "typebox": "^1.3.11"

@@ -22,11 +22,20 @@ import {
   MaskMap,
   collectSecretsFromText,
   loadDotenvPaths,
-  maskDeep,
   maskDeepFreeform,
+  maskDeepFreeformKeys,
   registerSources,
   type MaskOptions,
 } from "../src/mask-engine.ts";
+import { MaskedSecretInput } from "../src/masked-secret-input.ts";
+import {
+  assertShellSafeHandles,
+  containsSecretHandle,
+  planToolSecretResolution,
+  SecretResolutionError,
+  type ToolResolutionConfig,
+  type ToolResolutionRule,
+} from "../src/tool-secret-resolver.ts";
 
 interface Config {
   mode?: "auto" | "ask";
@@ -36,6 +45,7 @@ interface Config {
   extraSecrets?: { name: string; value: string }[];
   customPatterns?: { name: string; pattern: string; flags?: string }[];
   base64MinLength?: number;
+  toolResolution?: ToolResolutionConfig;
 }
 
 const CONFIG_FILE = join(dirname(fileURLToPath(import.meta.url)), "config.json");
@@ -48,8 +58,15 @@ const AGENT_GUIDANCE = `Secret-mask agent rules:
 - A __SECRET_*__ token shown in a tool result or returned by request_secret is a redacted alias, not proof that the literal token is on disk. The underlying value may come from .env, automatic detection, or persisted registration; absence of secrets.json does not prove it is unavailable.
 - If secret-mask produced a placeholder in this session, use it directly in bash commands and write/edit inputs. The extension restores the real value immediately before those local tools execute, and masks it again in tool output. A file read showing __SECRET_*__ is therefore a redacted view; do not replace the real value with the literal placeholder or conclude the config is invalid.
 - Never print, echo, or otherwise expose a real secret, and do not invent placeholder names. Validate an existing credential through the intended local operation using its placeholder.
-- Call request_secret only when the task genuinely needs a secret and no usable placeholder or existing local credential is available. Do not call it again for a placeholder already present. Ask only for the minimum secret name and purpose; after it returns, use the placeholder, never the real value.
+- Call request_secret only when the task genuinely needs a secret and no usable placeholder or existing local credential is available. Do not call it again for a placeholder already present unless the user requests replacement or the credential is confirmed invalid; use replace: true with its registered name to update it through masked input. Ask only for the minimum secret name and purpose; after it returns, use the placeholder, never the real value.
 - If a placeholder is unknown or an operation reports invalid credentials, report that result or request a new secret; do not infer from masked output or search for secrets.json.`;
+
+// These names carry content-block structure rather than user data. Key-only
+// fallback masking preserves them after schema-aware block fields are handled.
+const CONTENT_BLOCK_STRUCTURAL_KEYS = new Set([
+  "type", "role", "name", "id", "call_id", "tool_call_id", "tool_use_id",
+  "status", "signature", "mimeType", "media_type",
+]);
 
 function loadConfig(): Config {
   for (const path of [USER_CONFIG_FILE, CONFIG_FILE]) {
@@ -104,6 +121,27 @@ function validateConfig(raw: unknown): Config {
   if (typeof cfg.base64MinLength === "number" && Number.isFinite(cfg.base64MinLength) && cfg.base64MinLength > 0) {
     out.base64MinLength = cfg.base64MinLength;
   }
+  if (cfg.toolResolution && typeof cfg.toolResolution === "object") {
+    const resolution = cfg.toolResolution as Record<string, unknown>;
+    const rules: ToolResolutionRule[] = [];
+    if (Array.isArray(resolution.rules)) {
+      for (const candidate of resolution.rules) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const rule = candidate as Record<string, unknown>;
+        if (typeof rule.tool !== "string" || !Array.isArray(rule.paths)) continue;
+        const paths = rule.paths.filter((path): path is string => typeof path === "string" && path.length > 0);
+        if (paths.length === 0 || (rule.adapter !== undefined && rule.adapter !== "text" && rule.adapter !== "json")) continue;
+        rules.push({ tool: rule.tool, paths, adapter: rule.adapter as ToolResolutionRule["adapter"] });
+      }
+    }
+    out.toolResolution = {
+      enabled: typeof resolution.enabled === "boolean" ? resolution.enabled : true,
+      includeDefaults: typeof resolution.includeDefaults === "boolean" ? resolution.includeDefaults : true,
+      // Unknown handles remain blocked even if an old config requested ignore.
+      unknownHandle: "block",
+      rules,
+    };
+  }
   return out;
 }
 
@@ -123,6 +161,12 @@ export default function (pi: any) {
   const options = mergeOptions(config);
   const mode = config.mode ?? "ask";
   const allowCommands = config.allowCommands ?? [];
+  const resolutionConfig: ToolResolutionConfig = {
+    enabled: config.toolResolution?.enabled ?? true,
+    includeDefaults: config.toolResolution?.includeDefaults ?? true,
+    unknownHandle: "block",
+    rules: config.toolResolution?.rules ?? [],
+  };
 
   const map = new MaskMap();
   let dotenvMtimes = new Map<string, number>();
@@ -130,6 +174,83 @@ export default function (pi: any) {
   const secretSources = new Map<string, Set<string>>();
   // Secrets registered via /mask-secret (only these are persisted).
   const userSecrets = new Map<string, string>(); // name -> value
+
+  // Local capability grants: never persist or reconstruct from conversation history.
+  // Bind to both the session and the value, since handles may be reused on rotation.
+  const sessionApprovals = new Map<string, string>(); // handle -> approved value
+  let approvalSessionId: string | undefined;
+  let approvalEpoch = 0;
+  let sessionClosed = false;
+
+  function sessionId(ctx: any): string | undefined {
+    try {
+      const id = ctx?.sessionManager?.getSessionId?.();
+      return typeof id === "string" && id.length > 0 ? id : undefined;
+    } catch {
+      return undefined; // Stale or unavailable session context: never remember grants.
+    }
+  }
+
+  function clearSessionApprovals(): void {
+    sessionApprovals.clear();
+    approvalEpoch++;
+  }
+
+  function invalidateHandleApproval(handle: string | undefined): void {
+    if (handle === undefined) return;
+    sessionApprovals.delete(handle);
+    approvalEpoch++; // Also invalidate pending confirmations that captured this value.
+  }
+
+  /** A check retained across await boundaries; late UI replies cannot revive grants. */
+  function approvalGuard(ctx: any, handles: string[], signal?: AbortSignal): () => boolean {
+    const id = sessionId(ctx);
+    if (id !== approvalSessionId) {
+      clearSessionApprovals();
+      approvalSessionId = id;
+    }
+    const epoch = approvalEpoch;
+    const values = handles.map((handle) => [handle, map.secretFor(handle)] as const);
+    return () => !sessionClosed && epoch === approvalEpoch && sessionId(ctx) === id &&
+      !signal?.aborted && !ctx?.signal?.aborted &&
+      values.every(([handle, value]) => value !== undefined && map.secretFor(handle) === value);
+  }
+
+  /** Return a guard, not just a boolean: the caller must recheck before exposing/applying a handle. */
+  async function approveHandles(
+    ctx: any, handles: string[], title: string, message: string,
+    policyApproved = false, signal?: AbortSignal,
+  ): Promise<(() => boolean) | undefined> {
+    const current = approvalGuard(ctx, handles, signal);
+    if (!current()) return undefined;
+    const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.select || ctx?.ui?.confirm);
+    const canRemember = hasUI && ctx?.mode === "tui" && approvalSessionId !== undefined;
+    if (policyApproved || (canRemember && handles.every((handle) =>
+      sessionApprovals.has(handle) && sessionApprovals.get(handle) === map.secretFor(handle)))) {
+      return current;
+    }
+    if (!hasUI) return undefined;
+
+    if (ctx?.mode === "tui" && typeof ctx?.ui?.select === "function") {
+      const choices = ["Allow once", ...(canRemember ? ["Allow for this session"] : []), "Deny"];
+      const scope = canRemember
+        ? "\n\nSession allowance covers reuse and use of these credentials at ANY configured tool path, not just this call. It ends on session change or /reload. Revoke with /mask-secret-revoke."
+        : "";
+      const choice = await ctx.ui.select(`${title}\n\n${message}${scope}`, choices, { signal: signal ?? ctx?.signal });
+      if (!current()) return undefined;
+      if (choice === "Allow for this session" && canRemember) {
+        for (const handle of handles) sessionApprovals.set(handle, map.secretFor(handle)!);
+        ctx?.ui?.notify?.("Credentials allowed for this session. Revoke with /mask-secret-revoke.", "info");
+        return current;
+      }
+      return choice === "Allow once" ? current : undefined;
+    }
+
+    // Older UI hosts and RPC retain one-shot confirmation only; never silently escalate it.
+    const approved = typeof ctx?.ui?.confirm === "function" &&
+      await ctx.ui.confirm(title, message, { signal: signal ?? ctx?.signal });
+    return approved === true && current() ? current : undefined;
+  }
 
   // Extra secrets from config.
   for (const { name, value } of options.extraSecrets) {
@@ -147,7 +268,7 @@ export default function (pi: any) {
         for (const { name, value } of data) {
           if (value) {
             userSecrets.set(name, value);
-            map.add(value, name);
+            map.addRaw(value, name);
             addSource(value, `user:${name}`);
           }
         }
@@ -190,6 +311,7 @@ export default function (pi: any) {
     set.delete(source);
     if (set.size === 0) {
       secretSources.delete(secret);
+      invalidateHandleApproval(map.placeholderFor(secret));
       map.remove(secret);
     }
   }
@@ -198,11 +320,12 @@ export default function (pi: any) {
   function registerUserSecret(name: string, value: string): string {
     const prev = userSecrets.get(name);
     if (prev !== undefined && prev !== value) {
+      invalidateHandleApproval(map.placeholderFor(prev));
       // Old value keeps other sources (dotenv/extra/regex/seen) but loses "user".
       dropSource(prev, `user:${name}`);
     }
     userSecrets.set(name, value);
-    const ph = map.add(value, name);
+    const ph = map.addRaw(value, name);
     addSource(value, `user:${name}`);
     saveUserSecrets();
     return ph;
@@ -410,6 +533,8 @@ export default function (pi: any) {
     } else if (si && typeof si === "object" && Array.isArray(si.parts)) {
       maskBlocks(si.parts);
     }
+    // OpenAI Responses accepts either a string or an array for input.
+    if (typeof payload.input === "string") payload.input = maskText(payload.input);
     for (const key of ["messages", "input", "contents"]) {
       const list = payload[key];
       if (Array.isArray(list)) maskMessages(list);
@@ -451,8 +576,9 @@ export default function (pi: any) {
       if (block.functionResponse && typeof block.functionResponse === "object") {
         const fr = block.functionResponse;
         if (typeof fr.response === "object" && fr.response !== null) {
-          if (typeof fr.response.output === "string") fr.response.output = maskText(fr.response.output);
-          if (typeof fr.response.error === "string") fr.response.error = maskText(fr.response.error);
+          // Gemini function responses are arbitrary JSON, not only
+          // response.output/response.error.
+          maskDeepFreeform(fr.response, maskText);
         }
       }
       if (block.response && typeof block.response === "object" && typeof block.response.output === "string") {
@@ -496,6 +622,25 @@ export default function (pi: any) {
     }
   }
 
+  /** Capture only through Pi's TUI custom component; print/json modes fail closed. */
+  async function secureInput(ctx: any, name: string, purpose?: string): Promise<string | undefined> {
+    if (ctx?.mode !== "tui" || typeof ctx?.ui?.custom !== "function") return undefined;
+    return await ctx.ui.custom(
+      (tui: any, theme: any, _keybindings: any, done: (value: string | undefined) => void) =>
+        new MaskedSecretInput(name, purpose, tui, theme, done),
+    );
+  }
+
+  pi.on("session_start", (_event: any, ctx: any) => {
+    clearSessionApprovals();
+    approvalSessionId = sessionId(ctx);
+    sessionClosed = false;
+  });
+  pi.on("session_shutdown", () => {
+    clearSessionApprovals();
+    sessionClosed = true;
+  });
+
   // Keep the placeholder contract in the agent's system context. Tool results are
   // intentionally redacted, so the agent otherwise cannot tell a masked file view
   // from a literal placeholder stored on disk.
@@ -519,83 +664,51 @@ export default function (pi: any) {
   });
 
   pi.on("tool_call", async (event: any, ctx: any) => {
-    // Bail early if no placeholder anywhere (bash command / write / edit).
-    const inputStr = JSON.stringify(event.input ?? {});
-    if (!map.placeholders().some((ph) => inputStr.includes(ph))) return;
-
-    if (event.toolName === "bash") {
-      const command: string = event.input?.command ?? "";
-      // P0-6: refuse secrets whose real value contains any shell metacharacter.
-      // Strict whitelist: alnum + a few safe punctuation. Anything else
-      // (quotes, whitespace, $, backticks, ;, |, &, >, <, (, ), #, ...) is
-      // rejected rather than inlined into shell syntax.
-      const SAFE_SECRET_RE = /^[A-Za-z0-9._:\/@+=%-]+$/;
-      for (const ph of map.placeholders()) {
-        if (!command.includes(ph)) continue;
-        const secret = map.secretFor(ph) ?? "";
-        if (!SAFE_SECRET_RE.test(secret)) {
-          ctx?.ui?.notify?.(`Blocked: secret ${ph} contains shell-special characters that would change command semantics`, "warning");
-          return { block: true, reason: "Blocked by secret-mask: secret value is not safe to inline into a shell command" };
-        }
-      }
-      const unmasked = map.unmask(command);
-      if (mode === "ask") {
-        const allowed = allowCommands.some((pat) => {
-          let re: RegExp | null = null;
-          try {
-            re = new RegExp(pat);
-          } catch {
-            // Invalid pattern in config: must never allow anything (P1-2).
-            return false;
-          }
-          return command.startsWith(pat) || re.test(command);
-        });
-        if (!allowed) {
-          const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
-          const ok = hasUI
-            ? await ctx.ui.confirm("Secret mask", `Command contains secret placeholders. Run with real values?\n\n${command}\n\n(The dialog only shows placeholders, never real values)`)
-            : false;
-          if (!ok) {
-            ctx?.ui?.notify?.(`Blocked command containing secret placeholders: ${command.slice(0, 120)}`, "warning");
-            return { block: true, reason: "Blocked by secret-mask: requires real secret to run" };
-          }
-        }
-      }
-      event.input.command = unmasked;
-      return;
+    if (!containsSecretHandle(event.input)) return;
+    if (resolutionConfig.enabled === false) {
+      return { block: true, reason: "Blocked by secret-mask: secret-handle resolution is disabled" };
     }
 
-    // write/edit: swap placeholders back to real values so files store
-    // real values even though the agent only saw placeholders. In ask mode
-    // confirm too (P1-3) — placeholder usage is a secret capability.
-    if (event.toolName === "write" || event.toolName === "edit") {
-      if (mode === "ask") {
-        const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
-        const ok = hasUI
-          ? await ctx.ui.confirm("Secret mask", `Writing content that contains secret placeholders. Write real values?`)
-          : false;
-        if (!ok) {
-          ctx?.ui?.notify?.(`Blocked write/edit containing secret placeholders`, "warning");
-          return { block: true, reason: "Blocked by secret-mask: write/edit with secret placeholders requires confirmation" };
-        }
-      }
-      maskDeep(event.input, (s) => map.unmask(s));
+    let plan;
+    try {
+      plan = planToolSecretResolution(event.toolName, event.input ?? {}, map, resolutionConfig);
+      if (!plan) return;
+      assertShellSafeHandles(plan, map);
+    } catch (error) {
+      const message = error instanceof SecretResolutionError ? error.message : "Secret-handle resolution failed";
+      ctx?.ui?.notify?.(message, "warning");
+      return { block: true, reason: `Blocked by secret-mask: ${message}` };
     }
+
+    let approved = mode === "auto";
+    if (!approved && event.toolName === "bash") {
+      const command = String(event.input?.command ?? "");
+      approved = allowCommands.some((pattern) => {
+        try { return command.startsWith(pattern) || new RegExp(pattern).test(command); } catch { return false; }
+      });
+    }
+    const permission = await approveHandles(
+      ctx, plan.handles, "Use protected secret?",
+      `Tool: ${event.toolName}\nHandles: ${plan.handles.join(", ")}\nAuthorized argument paths: ${plan.paths.join(", ")}\n\nOnly handles are displayed; real values are not rendered.`,
+      approved,
+    );
+    if (!permission?.()) return { block: true, reason: "Blocked by secret-mask: secret-handle approval declined, cancelled, or expired" };
+    plan.apply();
   });
 
   pi.on("tool_result", (event: any) => {
-    if (!event.content) return;
     try {
-      // Output may contain runtime-generated secrets (e.g. aws sts output);
-      // collect them first, then mask. Only known text fields are touched so
-      // short .env values never corrupt block type/name structure (P1-12).
-      if (typeof event.content === "string") {
-        event.content = maskText(event.content);
-      } else if (Array.isArray(event.content)) {
+      // Preserve provider block handling, then cover arbitrary structured
+      // details and scalar textual fields without touching image/binary nodes.
+      if (typeof event.content === "string") event.content = maskText(event.content);
+      else if (Array.isArray(event.content)) {
         maskBlocks(event.content);
-      } else if (event.content && typeof event.content === "object") {
-        if (typeof event.content.text === "string") event.content.text = maskText(event.content.text);
-      }
+        // Content arrays have schema-bearing block fields, so mask arbitrary
+        // keys separately without rewriting structural string values.
+        maskDeepFreeformKeys(event.content, maskText, CONTENT_BLOCK_STRUCTURAL_KEYS);
+      } else if (event.content && typeof event.content === "object") maskDeepFreeform(event.content, maskText);
+      if (typeof event.details === "string") event.details = maskText(event.details);
+      else if (event.details && typeof event.details === "object") maskDeepFreeform(event.details, maskText);
     } catch {
       // Never let masking break tool results.
     }
@@ -680,73 +793,118 @@ export default function (pi: any) {
     }
   });
 
-  // /mask-secret <name> <value>: register a secret from user input
-  // (interactive or args). Persisted; agent never sees the real value.
-  pi.registerCommand("mask-secret", {
-    description: "Register a secret to be masked (interactive input or args, persisted)",
-    handler: async (args: string, ctx: any) => {
-      const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
-      let name = "USER";
-      let value = "";
-      if (parts.length >= 2) {
-        name = parts[0];
-        value = parts.slice(1).join(" ");
-      } else if (parts.length === 1) {
-        // Single arg is treated as the value; name defaults to USER.
-        value = parts[0];
-      } else {
-        value = (await ctx.ui.input("Secret value to mask (agent will not see it):", "")) ?? "";
-      }
-      value = value.trim();
-      if (!value) {
-        ctx.ui.notify("No secret provided, cancelled", "warning");
-        return;
-      }
-      const ph = registerUserSecret(name, value);
-      ctx.ui.notify(`Registered ${name} → ${ph} (agent sees placeholder only)`, "info");
+  const safeCredentialName = (value: string | undefined): string => {
+    const clean = [...(value ?? "")]
+      .filter((char) => {
+        const code = char.codePointAt(0)!;
+        return code >= 0x20 && code !== 0x7f && (code < 0x80 || code > 0x9f);
+      })
+      .slice(0, 80)
+      .join("")
+      .trim();
+    return clean || "USER";
+  };
+
+  pi.registerCommand("mask-secret-revoke", {
+    description: "Revoke all session-only secret approvals (keeps saved credentials and configured policy)",
+    handler: async (_args: string, ctx: any) => {
+      clearSessionApprovals();
+      ctx?.ui?.notify?.("Session secret approvals revoked. Saved credentials and mode/allowCommands policy are unchanged.", "info");
     },
   });
 
-  // request_secret: agent-initiated secret request. The user's input is
-  // masked immediately; the agent only receives the placeholder.
+  // Upstream-compatible command forms: one argument is the plaintext value
+  // under USER; NAME VALUE remains supported. No-argument capture is TUI-only.
+  pi.registerCommand("mask-secret", {
+    description: "Register a secret locally (masked TUI input or plaintext arguments, persisted)",
+    handler: async (args: string, ctx: any) => {
+      const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      let name = "USER";
+      let value: string | undefined;
+      if (parts.length >= 2) {
+        name = parts[0];
+        value = parts.slice(1).join(" ");
+        ctx?.ui?.notify?.("The secret was supplied in command text; masked input is safer.", "warning");
+      } else if (parts.length === 1) {
+        // Preserve the upstream /mask-secret VALUE contract.
+        value = parts[0];
+        ctx?.ui?.notify?.("The secret was supplied in command text; masked input is safer.", "warning");
+      } else {
+        value = await secureInput(ctx, name, "Register a local secret for later use");
+      }
+      if (!value) {
+        ctx?.ui?.notify?.("No secret provided, cancelled", "warning");
+        return;
+      }
+      const ph = registerUserSecret(name, value);
+      ctx?.ui?.notify?.(`Registered ${safeCredentialName(name)} → ${ph} (agent sees placeholder only)`, "info");
+    },
+  });
+
   pi.registerTool({
     name: "request_secret",
     label: "Request Secret",
-    description: `Request a secret (API key/token/password) from the user and register it in the masking system.
-Use this only when the task needs a secret and no usable placeholder or existing local credential is available; do not request one again for a placeholder already present.
-The value the user enters is masked into a placeholder; you only see the placeholder and never touch the real value.
-Use the returned placeholder directly in bash commands and write/edit inputs; the extension substitutes the real value locally and masks tool output again.
+    executionMode: "sequential", // Local input dialogs must not overlap sibling requests.
+    description: `Request an API key, token, username, or password through a local masked TUI prompt.
+The real value never appears in the tool result or conversation; this tool returns an opaque __SECRET_*__ handle.
+Use this only when the task needs a credential; do not request one again for a placeholder already present unless replacement is needed. Set replace: true to update an existing registered name through fresh masked input (never supply the value in tool arguments).
+Use that returned handle explicitly only in an authorized tool argument. Built-in authorization covers bash.command, powershell.command, write.content, edit old/new text (including edits arrays), and Pi MCP Adapter mcp.args object or JSON containers. Browser, direct MCP, and custom tools require configured toolResolution rules.
 ${AGENT_GUIDANCE}`,
     parameters: Type.Object({
-      name: Type.String({ description: "Secret name, e.g. OPENAI_API_KEY, GITHUB_TOKEN" }),
-      purpose: Type.Optional(Type.String({ description: "Purpose shown to the user" })),
+      name: Type.String({ description: "Credential name, e.g. OPENAI_API_KEY or GITHUB_TOKEN" }),
+      purpose: Type.Optional(Type.String({ description: "Short reason shown in the local prompt" })),
+      replace: Type.Optional(Type.Boolean({ description: "Replace an existing locally registered credential via fresh masked TUI input; defaults to false. Unknown names are not created in replacement mode." })),
     }),
     execute: async (
       _id: string,
-      params: { name: string; purpose?: string },
-      _signal: unknown,
+      params: { name: string; purpose?: string; replace?: boolean },
+      signal: AbortSignal | undefined,
       _onUpdate: unknown,
       ctx: any,
     ) => {
-      const name = params.name?.trim() || "USER";
-      const purpose = params.purpose?.trim();
-      if (!ctx?.ui?.input) {
+      const name = safeCredentialName(params.name);
+      const existing = userSecrets.get(name);
+      const replacing = params.replace === true;
+      if (replacing && existing === undefined) {
+        return { content: [{ type: "text" as const, text: `No locally registered credential named ${name}. Use request_secret without replace to register it; environment/config credentials must be updated at their source.` }], details: { name, updated: false } };
+      }
+      if (existing !== undefined && !replacing) {
+        // Reusing a persisted local credential is a capability grant too.
+        if (ctx?.mode !== "tui") {
+          return { content: [{ type: "text" as const, text: "A local credential may exist, but secure confirmation is unavailable in this mode." }] };
+        }
+        const handle = map.placeholderFor(existing);
+        if (!handle) return { content: [{ type: "text" as const, text: `Credential ${name} is unavailable.` }] };
+        const permission = await approveHandles(
+          ctx, [handle], "Reuse protected credential?",
+          `Reuse the locally registered credential ${name}? Only its handle ${handle} will be returned.`,
+          false, signal,
+        );
+        if (!permission?.() || userSecrets.get(name) !== existing) {
+          return { content: [{ type: "text" as const, text: `Reuse of ${name} declined, cancelled, or approval expired.` }] };
+        }
         return {
-          content: [{ type: "text" as const, text: "No interactive UI in this mode (print/json); cannot request a secret. Ask the user to register it via /mask-secret first." }],
+          content: [{ type: "text" as const, text: `Credential ${name} is available. Reuse handle ${handle}.` }],
+          details: { name, handle, reused: true },
         };
       }
-      const value = (await ctx.ui.input(
-        purpose ? `Enter ${name} (purpose: ${purpose}; the agent will not see it):` : `Enter ${name} (the agent will not see it):`,
-        "",
-      )) ?? "";
-      if (!value.trim()) {
+
+      const current = approvalGuard(ctx, [], signal);
+      if (!current()) return { content: [{ type: "text" as const, text: "Secret request cancelled or session closed." }] };
+      const value = await secureInput(ctx, name, replacing
+        ? `Replace the saved credential. Cancel keeps the existing value.${params.purpose ? ` Reason: ${params.purpose}` : ""}`
+        : params.purpose);
+      if (!current() || userSecrets.get(name) !== existing) return { content: [{ type: "text" as const, text: "Secret request cancelled or session/credential changed; no value saved." }] };
+      if (value === undefined) {
         return {
-          content: [{ type: "text" as const, text: `User cancelled input for ${name}` }],
+          content: [{ type: "text" as const, text: ctx?.mode === "tui" ? `User declined to provide ${name}.` : "Secure masked input is unavailable outside TUI mode." }],
+          details: { name, declined: true },
         };
       }
-      const ph = registerUserSecret(name, value.trim());
+      const ph = registerUserSecret(name, value);
       return {
-        content: [{ type: "text" as const, text: `Registered ${name}. Use placeholder ${ph} instead of the real value (bash/write substitute automatically). The real value is never exposed to you.` }],
+        content: [{ type: "text" as const, text: `${replacing ? "Updated" : "Registered"} ${name}. Use handle ${ph} explicitly in an authorized tool argument. The real value was not exposed.` }],
+        details: { name, handle: ph, ...(replacing ? { updated: true } : {}) },
       };
     },
   });
