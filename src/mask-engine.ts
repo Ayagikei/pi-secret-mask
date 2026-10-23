@@ -123,6 +123,22 @@ export function parseDotenv(content: string): { key: string; value: string }[] {
   return out;
 }
 
+/** Recognize a few typed, non-credential settings; unknown names remain secret. */
+export function isPublicDotenvEntry(key: string, value: string): boolean {
+  const name = key.toUpperCase();
+  // A public-looking suffix must never override a credential-bearing name.
+  if (/TOKEN|SECRET|PASS|PWD|KEY|AUTH|CREDENTIAL|COOKIE|SESSION|PRIVATE|SIGNATURE|DSN|CONNECTION/.test(name)) return false;
+  if (/(?:^|_)PORT$/.test(name)) return /^\d{1,5}$/.test(value) && Number(value) <= 65535;
+  if (/(?:^|_)(?:TTL|TIMEOUT|INTERVAL)$/.test(name)) return /^\d+(?:\.\d+)?$/.test(value);
+  if (/(?:^|_)PROVIDERS$/.test(name)) return /^[A-Za-z][A-Za-z0-9_-]{0,31}(?:,[A-Za-z][A-Za-z0-9_-]{0,31})*$/.test(value);
+  if (/(?:^|_)(?:PATH|DIR|FILE|BIN)$/.test(name)) {
+    // Paths/executable names only, not credential-bearing URLs or arbitrary text.
+    if (!/^(?:[A-Za-z]:)?[A-Za-z0-9_./~\\ -]+$/.test(value)) return false;
+    return /[\\/]/.test(value) || /^\.?[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+$/.test(value)
+      || (/(?:^|_)BIN$/.test(name) && /^[A-Za-z][A-Za-z0-9_.-]*$/.test(value));
+  }
+  return false;
+}
 /**
  * Read .env paths from disk (later files override earlier keys).
  *
@@ -259,14 +275,24 @@ export class MaskMap {
     return text.replace(re, (m) => this.secretToPlaceholder.get(m) ?? m);
   }
 
-  /** Unmask: placeholder -> real value. Only matches known placeholders as whole tokens (not adjacent to identifier chars). */
-  unmask(text: string): string {
-    if (this.placeholderToSecret.size === 0) return text;
-    const re = new RegExp(
+  private placeholderPattern(): RegExp | undefined {
+    if (this.placeholderToSecret.size === 0) return undefined;
+    return new RegExp(
       `(?<![A-Za-z0-9_])(?:${[...this.placeholderToSecret.keys()].map(escapeRegExp).join("|")})(?![A-Za-z0-9_])`,
       "g",
     );
-    return text.replace(re, (m) => this.placeholderToSecret.get(m) ?? m);
+  }
+
+  /** Known placeholders matched with the same token boundaries used by unmask. */
+  placeholdersIn(text: string): string[] {
+    const re = this.placeholderPattern();
+    return re ? [...new Set(text.match(re) ?? [])] : [];
+  }
+
+  /** Unmask: placeholder -> real value; adjacent identifier characters do not match. */
+  unmask(text: string): string {
+    const re = this.placeholderPattern();
+    return re ? text.replace(re, (m) => this.placeholderToSecret.get(m) ?? m) : text;
   }
 
   /** Recursively mask any structure (message content arrays etc.). Returns whether anything changed. */

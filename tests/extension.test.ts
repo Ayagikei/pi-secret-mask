@@ -586,3 +586,104 @@ test("extension: Mistral camelCase toolCalls, chat custom.input, image-like free
   for (const h of handlers) await h({ type: "before_provider_request", payload: p4 }, { cwd: tmp });
   assert.equal(p4.messages[0].content[0].thinking[0].text, "think __SECRET_K__", "mistral thinking array text masked");
 });
+
+// Regressions for ordinary Hub settings being treated as secret capabilities.
+test("extension: public dotenv settings stay readable and do not request confirmation", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), [
+    "PAPER_HUB_PORT=8123", "CODEXBAR_BIN=usage-cli", "PROVIDERS=alpha,beta",
+    "TODOS_PATH=tasks.md", "CACHE_DIR=/tmp/hub-cache", "PAPER_CACHE_TTL=60",
+    "PAPER_TOKEN=actual-token-value", "UNCLASSIFIED=unknown-value",
+  ].join("\n"));
+  const { pi } = await loadExtension(tmp, { mode: "ask" });
+  const payload = { text: "8123 usage-cli alpha,beta tasks.md /tmp/hub-cache 60 actual-token-value unknown-value" };
+  await pi.handlers.get("before_provider_request")![0]({ payload }, { cwd: tmp });
+  assert.equal(payload.text, "8123 usage-cli alpha,beta tasks.md /tmp/hub-cache 60 __SECRET_PAPER_TOKEN__ __SECRET_UNCLASSIFIED__");
+  let confirmations = 0;
+  const ctx = { hasUI: true, ui: { confirm: async () => { confirmations++; return true; } } };
+  const event = { toolName: "write", input: { path: "/tmp/config", content: payload.text.split(" __SECRET_PAPER_TOKEN__")[0] } };
+  await pi.handlers.get("tool_call")![0](event, ctx);
+  assert.equal(confirmations, 0);
+});
+
+test("extension: sensitive names and key-shaped values override public dotenv types", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const key = "sk-" + "a".repeat(30);
+  writeFileSync(join(tmp, ".env"), [
+    "API_KEY_PATH=/private/key-file", "TOKEN_PORT=8124", `TOOL_BIN=${key}`,
+    "CUSTOM_BIN=custom-credential", "SERVICE_PORT=not-a-port",
+  ].join("\n"));
+  const { pi } = await loadExtension(tmp, {
+    mode: "ask", customPatterns: [{ name: "CUSTOM", pattern: "custom-credential" }],
+  });
+  const payload = { text: `/private/key-file 8124 ${key} custom-credential not-a-port` };
+  await pi.handlers.get("before_provider_request")![0]({ payload }, { cwd: tmp });
+  assert.equal(payload.text, "__SECRET_API_KEY_PATH__ __SECRET_TOKEN_PORT__ __SECRET_TOOL_BIN__ __SECRET_CUSTOM_BIN__ __SECRET_SERVICE_PORT__");
+});
+
+test("extension: explicit registration still protects public-looking dotenv values", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "APP_PORT=8125\n");
+  const { pi } = await loadExtension(tmp, { mode: "ask", extraSecrets: [{ name: "PIN", value: "8125" }] });
+  const payload = { text: "8125" };
+  await pi.handlers.get("before_provider_request")![0]({ payload }, { cwd: tmp });
+  assert.equal(payload.text, "__SECRET_PIN__");
+  const event = { toolName: "bash", input: { command: "use __SECRET_PIN__" } };
+  const result = await pi.handlers.get("tool_call")![0](event, { hasUI: false });
+  assert.equal(result?.block, true, "real registered secrets still require approval");
+  assert.equal(event.input.command, "use __SECRET_PIN__", "denied inputs remain masked");
+});
+
+test("extension: ask only confirms placeholders that will actually be restored", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const { pi } = await loadExtension(tmp, {
+    mode: "ask", extraSecrets: [{ name: "SAFE_CAP", value: "safe-value" }, { name: "UNSAFE_CAP", value: "unsafe value" }],
+  });
+  let confirmations = 0;
+  const ctx = { hasUI: true, ui: { confirm: async () => { confirmations++; return true; } } };
+  const call = pi.handlers.get("tool_call")![0];
+  for (const command of ["echo __SECRET_SAFE_CAP__suffix", "echo prefix__SECRET_UNSAFE_CAP__", "echo __SECRET_UNKNOWN__"]) {
+    const event = { toolName: "bash", input: { command } };
+    assert.equal(await call(event, ctx), undefined);
+    assert.equal(event.input.command, command);
+  }
+  for (const toolName of ["write", "edit"]) {
+    const event = { toolName, input: { path: "/tmp/x", content: "prefix__SECRET_SAFE_CAP__suffix" } };
+    assert.equal(await call(event, ctx), undefined);
+    assert.equal(event.input.content, "prefix__SECRET_SAFE_CAP__suffix");
+  }
+  assert.equal(confirmations, 0, "no confirmation when no full token is restored");
+
+  const mixed = { toolName: "bash", input: { command: "use __SECRET_SAFE_CAP__ prefix__SECRET_UNSAFE_CAP__" } };
+  assert.equal(await call(mixed, ctx), undefined);
+  assert.equal(mixed.input.command, "use safe-value prefix__SECRET_UNSAFE_CAP__");
+  assert.equal(confirmations, 1, "confirm the real use, not the embedded unsafe name");
+
+  const unsafe = { toolName: "bash", input: { command: "use __SECRET_UNSAFE_CAP__" } };
+  assert.equal((await call(unsafe, ctx))?.block, true, "full unsafe token remains blocked");
+});
+
+test("extension: write/edit real placeholders still require approval and preserve input when denied", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const { pi } = await loadExtension(tmp, { mode: "ask", extraSecrets: [{ name: "CAP", value: "protected-value" }] });
+  const call = pi.handlers.get("tool_call")![0];
+  for (const toolName of ["write", "edit"]) {
+    const input = toolName === "write"
+      ? { path: "/tmp/x", content: "value=__SECRET_CAP__" }
+      : { path: "/tmp/x", oldText: "__SECRET_CAP__", newText: "__SECRET_CAP__ updated" };
+    const event = { toolName, input: { ...input } };
+    assert.equal((await call(event, { hasUI: false }))?.block, true);
+    assert.deepEqual(event.input, input);
+    let confirmations = 0;
+    const result = await call(event, { hasUI: true, ui: { confirm: async () => { confirmations++; return true; } } });
+    assert.equal(result, undefined);
+    assert.equal(confirmations, 1);
+    assert.equal(JSON.stringify(event.input).includes("protected-value"), true);
+    assert.equal(JSON.stringify(event.input).includes("__SECRET_CAP__"), false);
+  }
+});

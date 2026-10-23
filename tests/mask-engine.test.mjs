@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   MaskMap,
+  isPublicDotenvEntry,
   collectPatternSecrets,
   collectSecretsFromText,
   maskDeep,
@@ -16,6 +17,34 @@ test("MaskMap: basic mask and unmask", () => {
   const masked = m.mask("use sk-secret-abcdef123456 here");
   assert.equal(masked, "use __SECRET_OPENAI__ here");
   assert.equal(m.unmask(masked), "use sk-secret-abcdef123456 here");
+});
+
+test("dotenv public settings: require a safe name and a matching typed value", () => {
+  const cases = [
+    ["APP_PORT", "0", true], ["APP_PORT", "65535", true],
+    ["APP_PORT", "65536", false], ["APP_PORT", "-1", false],
+    ["APP_PORT", "8123;echo", false], ["TOKEN_PORT", "8123", false],
+    ["CACHE_TTL", "0.5", true], ["SESSION_TIMEOUT", "60", false],
+    ["PROVIDERS", "alpha,beta", true], ["PROVIDERS", "name@credential", false],
+    ["MY_KEY_PATH", "/tmp/file", false], ["CONFIG_PATH", "config.json", true],
+    ["CACHE_DIR", "/tmp/cache dir", true], ["TOOL_BIN", "usage-cli", true],
+    ["tool_bin", "/usr/bin/usage-cli", true], ["TOOL_BIN", "run && exfiltrate", false],
+    ["CONFIG_PATH", "https://user:password@example.test", false],
+    ["CONFIG_PATH", "untyped-value", false], ["APP_SETTING", "value", false],
+    ["ROLE", "user", false], ["PORT", "1234", true],
+  ];
+  for (const [key, value, expected] of cases) {
+    assert.equal(isPublicDotenvEntry(key, value), expected, `${key}=${value}`);
+  }
+});
+
+test("MaskMap: confirmation tokens share exact unmask boundaries", () => {
+  const m = new MaskMap();
+  m.add("one", "CAP");
+  m.add("two", "CAP_2");
+  const text = "__SECRET_CAP__suffix prefix__SECRET_CAP__ __SECRET_UNKNOWN__ '__SECRET_CAP__' __SECRET_CAP_2__ __SECRET_CAP__";
+  assert.deepEqual(m.placeholdersIn(text), ["__SECRET_CAP__", "__SECRET_CAP_2__"]);
+  assert.equal(m.unmask(text), "__SECRET_CAP__suffix prefix__SECRET_CAP__ __SECRET_UNKNOWN__ 'one' two one");
 });
 
 test("MaskMap: multiple placeholders roll back independently", () => {

@@ -21,8 +21,8 @@ import {
   DEFAULT_MASK_OPTIONS,
   MaskMap,
   collectSecretsFromText,
+  isPublicDotenvEntry,
   loadDotenvPaths,
-  maskDeep,
   maskDeepFreeform,
   registerSources,
   type MaskOptions,
@@ -239,7 +239,12 @@ export default function (pi: any) {
     try {
       // Read exactly the paths seen during scanning, unconditionally:
       // a vanished file throws and aborts the whole refresh (P0-3 TOCTOU).
-      entries = loadDotenvPaths({ readFileSync }, [...scanned.keys()], options.dotenv);
+      const loaded = loadDotenvPaths({ readFileSync }, [...scanned.keys()], options.dotenv);
+      entries = new Map([...loaded].filter(([key, value]) =>
+        !isPublicDotenvEntry(key, value)
+        || [...(secretSources.get(value) ?? [])].some((source) => source !== "dotenv")
+        || collectSecretsFromText(value, options).length > 0,
+      ));
     } catch {
       // .env changed but is unreadable: keep the old mapping (do NOT commit
       // mtime, so we retry next request; never abort the provider hook).
@@ -519,19 +524,14 @@ export default function (pi: any) {
   });
 
   pi.on("tool_call", async (event: any, ctx: any) => {
-    // Bail early if no placeholder anywhere (bash command / write / edit).
-    const inputStr = JSON.stringify(event.input ?? {});
-    if (!map.placeholders().some((ph) => inputStr.includes(ph))) return;
-
     if (event.toolName === "bash") {
       const command: string = event.input?.command ?? "";
+      const placeholders = map.placeholdersIn(command);
+      if (placeholders.length === 0) return;
       // P0-6: refuse secrets whose real value contains any shell metacharacter.
-      // Strict whitelist: alnum + a few safe punctuation. Anything else
-      // (quotes, whitespace, $, backticks, ;, |, &, >, <, (, ), #, ...) is
-      // rejected rather than inlined into shell syntax.
+      // Only inspect whole tokens that will actually be restored.
       const SAFE_SECRET_RE = /^[A-Za-z0-9._:\/@+=%-]+$/;
-      for (const ph of map.placeholders()) {
-        if (!command.includes(ph)) continue;
+      for (const ph of placeholders) {
         const secret = map.secretFor(ph) ?? "";
         if (!SAFE_SECRET_RE.test(secret)) {
           ctx?.ui?.notify?.(`Blocked: secret ${ph} contains shell-special characters that would change command semantics`, "warning");
@@ -565,10 +565,11 @@ export default function (pi: any) {
       return;
     }
 
-    // write/edit: swap placeholders back to real values so files store
-    // real values even though the agent only saw placeholders. In ask mode
-    // confirm too (P1-3) — placeholder usage is a secret capability.
+    // Prepare a copy so denied writes retain their masked input. Confirm only
+    // when restoring an actual known token, not a substring or an object key.
     if (event.toolName === "write" || event.toolName === "edit") {
+      const unmaskedInput = structuredClone(event.input ?? {});
+      if (!map.unmaskDeep(unmaskedInput)) return;
       if (mode === "ask") {
         const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
         const ok = hasUI
@@ -579,7 +580,7 @@ export default function (pi: any) {
           return { block: true, reason: "Blocked by secret-mask: write/edit with secret placeholders requires confirmation" };
         }
       }
-      maskDeep(event.input, (s) => map.unmask(s));
+      Object.assign(event.input, unmaskedInput);
     }
   });
 

