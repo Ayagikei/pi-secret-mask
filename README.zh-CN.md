@@ -18,8 +18,9 @@
   `CONNECTION`）的一律掩码；内置/自定义凭据模式或已注册值会覆盖「公开」分类。
 - **用户注册密钥**：`/mask-secret` 命令和 `request_secret` 工具让用户注册
   密钥，agent 只看到占位符。
-- **真实值用在需要的地方**：bash 命令、`write`、`edit` 自动把占位符替换为
-  真实值（文件里存的是真实值；全新写入的值不受影响）。
+- **真实值用在需要的地方**：bash 命令和写文件工具（`write`、`edit`、
+  hashline 的 `replace`/`insert`）自动把占位符替换为真实值（文件里存的是
+  真实值；全新写入的值不受影响）。
 - **Compaction 安全**：压缩（compaction）和分支导航（tree）的摘要消息同样
   掩码。
 
@@ -70,12 +71,19 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 通过 `/mask-secret` 或 `request_secret` 注册的密钥持久化在
 `~/.pi/agent/extensions/pi-secret-mask/secrets.json`（权限 0600），重启保留。
 `.env` 和自动识别的密钥不一定写入这个文件；它们可能只在当前会话可用。
-在 bash 命令或 `write`/`edit` 写文件时使用占位符，扩展会在本地执行前自动替换为真实值。
+在 bash 命令或写文件工具（`write`、`edit`、hashline 的 `replace`/`insert`）
+里使用占位符，扩展会在本地执行前自动替换为真实值。
+
+`ask` 模式下确认框提供四个选项：**仅本次允许**、**本会话始终允许**、
+**永久允许（写入 mode=auto）**、**拒绝**。会话授权只存在内存里，进程结束即失效；
+“永久允许”会把 `mode: "auto"` 写进
+`~/.pi/agent/extensions/pi-secret-mask/config.json`，之后不再询问（改回 `ask`
+即可恢复询问）。
 
 ### 给 agent 的占位符规则
 
 - 工具输出或 `request_secret` 返回的 `__SECRET_*__` 是脱敏别名，不是磁盘中真实存储的字面量。读取配置时看到占位符，只能说明输出被掩码了，不能据此判断配置无效。
-- 已由本插件产生的 placeholder 可以直接用于 bash、`write` 和 `edit`；扩展会在本地执行前还原真实值，工具输出再掩码。不要把真实值打印出来，也不要把字面量 placeholder 写入配置来“修复”它。
+- 已由本插件产生的 placeholder 可以直接用于 bash 和写文件工具（`write`、`edit`、`replace`、`insert`）；扩展会在本地执行前还原真实值，工具输出再掩码。不要把真实值打印出来，也不要把字面量 placeholder 写入配置来“修复”它。
 - 如果已有可用 placeholder 或本地配置，不要重复调用 `request_secret`。只有任务确实需要 secret 且没有可用凭据时才调用；调用后继续使用返回的 placeholder，不要索要或猜测真实值。
 - 不要因为找不到 `secrets.json` 就判定 secret 不存在；也不要自行发明 placeholder。验证凭据应执行实际的本地操作；若操作明确返回无效，再报告或请求新的 secret。
 
@@ -84,7 +92,7 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 | 钩子 | 动作 |
 |---|---|
 | `before_provider_request` | 标准消息与自定义 provider 顶层 `text` 中：真实值 → 占位符 |
-| `tool_call` | bash 占位符 → 真实值（auto/ask）；write/edit 仅还原已知完整占位符；仅在实际会还原时才 ask/无 UI 拦截 |
+| `tool_call` | bash 占位符 → 真实值（auto/ask）；写文件工具（`write`、`edit`、`replace`、`insert`，以及配置里的 `writeTools`）仅还原已知完整占位符；仅在实际会还原时才 ask/无 UI 拦截 |
 | `tool_result` | 工具输出中的真实值 → 占位符（防止回流） |
 | `session_before_compact` | 压缩摘要消息同样掩码 |
 | `session_before_tree` | 分支/树摘要消息同样掩码 |
@@ -99,6 +107,7 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 {
   "mode": "ask",
   "allowCommands": [],
+  "writeTools": [],
   "dotenv": { "enabled": true, "files": [".env", ".env.local", ".env.production", ".env.development"], "exclude": [".env.example", ".env.sample"] },
   "patterns": { "openai": true, "github": true, "google": true, "aws": true, "jwt": true, "pem": true, "base64": false },
   "extraSecrets": [],
@@ -106,9 +115,12 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 }
 ```
 
-- `mode`：`ask`（默认——bash/write/edit 将把**已知完整**占位符还原为真实值
-  前弹确认；print/json 等无 UI 模式直接拦截）| `auto`（静默替换）。未知或
-  嵌入的 `__SECRET_*__` 子串不会触发确认。
+- `mode`：`ask`（默认——bash 命令或写文件将把**已知完整**占位符还原为真实值
+  前，给出「仅本次 / 本会话 / 永久允许 / 拒绝」四个选项；print/json 等无 UI
+  模式直接拦截）| `auto`（静默替换）。未知或嵌入的 `__SECRET_*__` 子串不会
+  触发确认。
+- `writeTools`：额外视为「写文件工具」的工具名，其输入里的占位符会被还原。
+  默认 `write`、`edit`、`replace`、`insert`、`replace_match`。
 - `extraSecrets`：`{ "name", "value" }` 始终掩码（用于名称看似公开但实际敏感
   的配置）
 - `allowCommands`：完整命令字符串模式列表，命中跳过确认（这只是跳过确认，
@@ -142,6 +154,9 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 - **检测基于模式，并非完美**：未知格式的 secret 只有匹配内置或自定义
   模式、出现在 `.env*` 中（未知名默认掩码）、或手动注册时才会被捕获。
   窄 `.env` 公开规则仅减少普通配置的误报；未识别格式的 secret 仍可能漏过。
+- 「本会话始终允许」和「永久允许」等于关掉还原前的确认闸门（后者把
+  `mode` 设为 `auto`）。便利性和拦截强度由你取舍；想恢复询问就把 `mode`
+  改回 `ask`。
 - 本扩展是纵深防御，**不是安全边界**。它以你的用户权限运行，无法防御
   恶意 prompt、恶意仓库或本地外传。安装前请审查扩展源码；处理不可信
   代码请使用操作系统级沙箱。

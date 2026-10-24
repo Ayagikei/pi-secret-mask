@@ -36,6 +36,8 @@ interface Config {
   extraSecrets?: { name: string; value: string }[];
   customPatterns?: { name: string; pattern: string; flags?: string }[];
   base64MinLength?: number;
+  /** Extra tool names whose input strings are written to local files, so placeholders must be restored. */
+  writeTools?: string[];
 }
 
 const CONFIG_FILE = join(dirname(fileURLToPath(import.meta.url)), "config.json");
@@ -44,9 +46,16 @@ const USER_CONFIG_FILE = join(homedir(), ".pi/agent/extensions/pi-secret-mask/co
 /** Secrets registered via /mask-secret, persisted in the user config dir. */
 const USER_SECRETS_FILE = join(homedir(), ".pi/agent/extensions/pi-secret-mask/secrets.json");
 
+/**
+ * Tools whose input strings end up in local files. Placeholders must be
+ * restored before they run, otherwise the literal placeholder is written to
+ * disk (this is how an API key once landed in auth.json). `write`/`edit` are
+ * Pi builtins; `replace`/`insert`/`replace_match` come from hashline editors.
+ */
+const DEFAULT_WRITE_TOOLS = ["write", "edit", "replace", "insert", "replace_match"];
 const AGENT_GUIDANCE = `Secret-mask agent rules:
 - A __SECRET_*__ token shown in a tool result or returned by request_secret is a redacted alias, not proof that the literal token is on disk. The underlying value may come from .env, automatic detection, or persisted registration; absence of secrets.json does not prove it is unavailable.
-- If secret-mask produced a placeholder in this session, use it directly in bash commands and write/edit inputs. The extension restores the real value immediately before those local tools execute, and masks it again in tool output. A file read showing __SECRET_*__ is therefore a redacted view; do not replace the real value with the literal placeholder or conclude the config is invalid.
+- If secret-mask produced a placeholder in this session, use it directly in bash commands and in file-editing tool input (write, edit, replace, insert). The extension restores the real value immediately before those local tools execute, and masks it again in tool output. A file read showing __SECRET_*__ is therefore a redacted view; do not replace the real value with the literal placeholder or conclude the config is invalid.
 - Never print, echo, or otherwise expose a real secret, and do not invent placeholder names. Validate an existing credential through the intended local operation using its placeholder.
 - Call request_secret only when the task genuinely needs a secret and no usable placeholder or existing local credential is available. Do not call it again for a placeholder already present. Ask only for the minimum secret name and purpose; after it returns, use the placeholder, never the real value.
 - If a placeholder is unknown or an operation reports invalid credentials, report that result or request a new secret; do not infer from masked output or search for secrets.json.`;
@@ -72,6 +81,7 @@ function validateConfig(raw: unknown): Config {
   else out.mode = "ask"; // invalid mode -> safe default
   if (Array.isArray(cfg.allowCommands)) out.allowCommands = cfg.allowCommands.filter((x) => typeof x === "string");
   else out.allowCommands = [];
+  if (Array.isArray(cfg.writeTools)) out.writeTools = cfg.writeTools.filter((x) => typeof x === "string" && x.length > 0);
   if (cfg.dotenv && typeof cfg.dotenv === "object") {
     const d = cfg.dotenv;
     const nd: NonNullable<Config["dotenv"]> = {};
@@ -121,8 +131,79 @@ function mergeOptions(config: Config): MaskOptions {
 export default function (pi: any) {
   const config = validateConfig(loadConfig());
   const options = mergeOptions(config);
-  const mode = config.mode ?? "ask";
+  /** Restore policy; "auto" restores silently, "ask" prompts once per call. */
+  let mode = config.mode ?? "ask";
   const allowCommands = config.allowCommands ?? [];
+  /** Set by the "Allow for this session" choice; cleared on restart/reload. */
+  let sessionAllowAll = false;
+  const writeToolNames = new Set([...DEFAULT_WRITE_TOOLS, ...(config.writeTools ?? [])]);
+
+  const RESTORE_ONCE = "Allow once";
+  const RESTORE_SESSION = "Allow for this session (until Pi restarts)";
+  const RESTORE_ALWAYS = "Always allow (save mode=auto to config)";
+  const RESTORE_DENY = "Deny";
+
+  /** Persist `mode` so later sessions stop asking. Returns false when the write fails. */
+  function persistMode(next: "auto" | "ask"): boolean {
+    try {
+      const dir = dirname(USER_CONFIG_FILE);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+      // A user config shadows the package-local one, so seed it from whichever
+      // config is in effect now instead of dropping its settings.
+      let base: Record<string, unknown> = {};
+      for (const path of [USER_CONFIG_FILE, CONFIG_FILE]) {
+        if (!existsSync(path)) continue;
+        try {
+          base = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+        } catch {
+          base = {};
+        }
+        break;
+      }
+      base.mode = next;
+      const tmp = USER_CONFIG_FILE + ".tmp" + process.pid;
+      writeFileSync(tmp, JSON.stringify(base, null, 2), { mode: 0o600 });
+      chmodSync(tmp, 0o600);
+      renameSync(tmp, USER_CONFIG_FILE);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Approve restoring real secret values for one tool call. mode=auto and a
+   * session grant skip the dialog; otherwise offer once/session/permanent/deny.
+   */
+  async function approveRestore(kind: "command" | "write", detail: string, ctx: any): Promise<boolean> {
+    if (mode === "auto" || sessionAllowAll) return true;
+    const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
+    if (!hasUI) return false;
+    const title = `Secret mask: restore real secret values for this ${kind}?\n${detail}`;
+    // RPC and older clients only expose confirm(); the TUI offers the 4-way choice.
+    if (typeof ctx?.ui?.select !== "function") {
+      return Boolean(await ctx.ui.confirm("Secret mask", `${title}\n\nThe dialog only shows placeholders, never real values`));
+    }
+    const choice = await ctx.ui.select(title, [RESTORE_ONCE, RESTORE_SESSION, RESTORE_ALWAYS, RESTORE_DENY]);
+    if (choice === RESTORE_ONCE) return true;
+    if (choice === RESTORE_SESSION) {
+      sessionAllowAll = true;
+      ctx?.ui?.notify?.("Secret mask: restoring secrets is allowed for this session; restart Pi to be asked again.", "info");
+      return true;
+    }
+    if (choice === RESTORE_ALWAYS) {
+      mode = "auto";
+      const saved = persistMode("auto");
+      ctx?.ui?.notify?.(
+        saved
+          ? `Secret mask: saved mode=auto to ${USER_CONFIG_FILE}; future sessions will not ask.`
+          : "Secret mask: allowed for this session only (config file could not be written).",
+        saved ? "info" : "warning",
+      );
+      return true;
+    }
+    return false;
+  }
 
   const map = new MaskMap();
   let dotenvMtimes = new Map<string, number>();
@@ -551,10 +632,7 @@ export default function (pi: any) {
           return command.startsWith(pat) || re.test(command);
         });
         if (!allowed) {
-          const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
-          const ok = hasUI
-            ? await ctx.ui.confirm("Secret mask", `Command contains secret placeholders. Run with real values?\n\n${command}\n\n(The dialog only shows placeholders, never real values)`)
-            : false;
+          const ok = await approveRestore("command", `bash: ${command.slice(0, 300)}`, ctx);
           if (!ok) {
             ctx?.ui?.notify?.(`Blocked command containing secret placeholders: ${command.slice(0, 120)}`, "warning");
             return { block: true, reason: "Blocked by secret-mask: requires real secret to run" };
@@ -567,17 +645,18 @@ export default function (pi: any) {
 
     // Prepare a copy so denied writes retain their masked input. Confirm only
     // when restoring an actual known token, not a substring or an object key.
-    if (event.toolName === "write" || event.toolName === "edit") {
+    // File-editing tools: builtin write/edit plus hashline replace/insert. Their
+    // input strings land in a local file, so restore before the tool runs.
+    // A copy keeps the masked input when the call is denied.
+    if (writeToolNames.has(event.toolName)) {
       const unmaskedInput = structuredClone(event.input ?? {});
       if (!map.unmaskDeep(unmaskedInput)) return;
-      if (mode === "ask") {
-        const hasUI = ctx?.hasUI ?? Boolean(ctx?.ui?.confirm);
-        const ok = hasUI
-          ? await ctx.ui.confirm("Secret mask", `Writing content that contains secret placeholders. Write real values?`)
-          : false;
+      if (mode === "ask" && !sessionAllowAll) {
+        const target = typeof event.input?.path === "string" ? event.input.path : "";
+        const ok = await approveRestore("write", `${event.toolName}${target ? `: ${target}` : ""}`, ctx);
         if (!ok) {
-          ctx?.ui?.notify?.(`Blocked write/edit containing secret placeholders`, "warning");
-          return { block: true, reason: "Blocked by secret-mask: write/edit with secret placeholders requires confirmation" };
+          ctx?.ui?.notify?.(`Blocked ${event.toolName} containing secret placeholders`, "warning");
+          return { block: true, reason: `Blocked by secret-mask: ${event.toolName} with secret placeholders requires confirmation` };
         }
       }
       Object.assign(event.input, unmaskedInput);
@@ -716,7 +795,7 @@ export default function (pi: any) {
     description: `Request a secret (API key/token/password) from the user and register it in the masking system.
 Use this only when the task needs a secret and no usable placeholder or existing local credential is available; do not request one again for a placeholder already present.
 The value the user enters is masked into a placeholder; you only see the placeholder and never touch the real value.
-Use the returned placeholder directly in bash commands and write/edit inputs; the extension substitutes the real value locally and masks tool output again.
+Use the returned placeholder directly in bash commands and file-editing tool input (write, edit, replace, insert); the extension substitutes the real value locally and masks tool output again.
 ${AGENT_GUIDANCE}`,
     parameters: Type.Object({
       name: Type.String({ description: "Secret name, e.g. OPENAI_API_KEY, GITHUB_TOKEN" }),

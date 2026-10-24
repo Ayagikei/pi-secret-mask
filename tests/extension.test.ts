@@ -68,14 +68,14 @@ test("extension: explains masked views, editing, and when to request secrets", a
   assert.ok(beforeAgentStart?.length, "before_agent_start handler registered");
   const result = await beforeAgentStart![0]({ systemPrompt: "base prompt" }, {});
   assert.match(result.systemPrompt, /redacted alias/);
-  assert.match(result.systemPrompt, /write\/edit inputs/);
+  assert.match(result.systemPrompt, /file-editing tool input \(write, edit, replace, insert\)/);
   assert.match(result.systemPrompt, /only when the task genuinely needs a secret/);
   assert.match(result.systemPrompt, /absence of secrets\.json does not prove/);
 
   const requestSecret = pi.tools.get("request_secret");
   assert.ok(requestSecret, "request_secret tool registered");
   assert.match(requestSecret.description, /do not request one again for a placeholder already present/);
-  assert.match(requestSecret.description, /write\/edit inputs/);
+  assert.match(requestSecret.description, /file-editing tool input \(write, edit, replace, insert\)/);
 });
 
 test("extension: before_provider_request masks messages + system + tools and returns payload", async (t) => {
@@ -686,4 +686,100 @@ test("extension: write/edit real placeholders still require approval and preserv
     assert.equal(JSON.stringify(event.input).includes("protected-value"), true);
     assert.equal(JSON.stringify(event.input).includes("__SECRET_CAP__"), false);
   }
+});
+
+test("extension: hashline replace/insert restore placeholders (only for file-editing tools)", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  writeFileSync(join(tmp, ".env"), "AUTHKEY=real-auth-key-value\n");
+  const { pi } = await loadExtension(tmp, { mode: "auto", writeTools: ["custom_writer"] });
+  for (const h of pi.handlers.get("before_provider_request") ?? []) {
+    await h({ type: "before_provider_request", payload: { model: "x", text: "" } }, { cwd: tmp });
+  }
+  const call = pi.handlers.get("tool_call")![0];
+
+  // hashline `insert`: `text` is written into the file, so it must be unmasked.
+  const insert = { toolName: "insert", input: { anchor: "AAaa", direction: "after", text: '"key": "__SECRET_AUTHKEY__"' } };
+  assert.equal(await call(insert, {}), undefined);
+  assert.equal(insert.input.text, '"key": "real-auth-key-value"', "insert text restored");
+
+  // hashline `replace`: same, and anchors must stay untouched.
+  const replace = { toolName: "replace", input: { remove_from: "AAaa", remove_to: "BBbb", text: '__SECRET_AUTHKEY__' } };
+  assert.equal(await call(replace, {}), undefined);
+  assert.equal(replace.input.text, "real-auth-key-value");
+  assert.equal(replace.input.remove_from, "AAaa");
+
+  // Config-registered extra write tools behave the same.
+  const custom = { toolName: "custom_writer", input: { path: "/tmp/x", body: "__SECRET_AUTHKEY__" } };
+  assert.equal(await call(custom, {}), undefined);
+  assert.equal(custom.input.body, "real-auth-key-value");
+
+  // Tools that are not file editors keep the placeholder: no accidental restore.
+  const other = { toolName: "remote_send", input: { body: "__SECRET_AUTHKEY__" } };
+  assert.equal(await call(other, {}), undefined);
+  assert.equal(other.input.body, "__SECRET_AUTHKEY__");
+});
+
+test("extension: ask dialog offers once / session / permanent allow and deny", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const { pi } = await loadExtension(tmp, { mode: "ask", extraSecrets: [{ name: "CAP", value: "protected-value" }] });
+  const call = pi.handlers.get("tool_call")![0];
+
+  // "Allow once" approves this call only: the next call asks again.
+  let asks = 0;
+  const once = { hasUI: true, ui: { select: async () => { asks++; return "Allow once"; } } };
+  let ev = { toolName: "bash", input: { command: "echo __SECRET_CAP__" } };
+  assert.equal(await call(ev, once), undefined);
+  assert.equal(ev.input.command, "echo protected-value");
+  ev = { toolName: "bash", input: { command: "echo __SECRET_CAP__" } };
+  assert.equal(await call(ev, once), undefined);
+  assert.equal(asks, 2, "once does not grant a session");
+
+  // Deny blocks and keeps the masked input.
+  const deny = { hasUI: true, ui: { select: async () => "Deny" } };
+  const denied = { toolName: "write", input: { path: "/tmp/x", content: "__SECRET_CAP__" } };
+  assert.equal((await call(denied, deny))?.block, true);
+  assert.equal(denied.input.content, "__SECRET_CAP__");
+
+  // "Allow for this session" stops asking for later calls, in any tool.
+  let sessionAsks = 0;
+  const session = { hasUI: true, ui: { select: async () => { sessionAsks++; return "Allow for this session (until Pi restarts)"; }, notify: () => {} } };
+  ev = { toolName: "bash", input: { command: "echo __SECRET_CAP__" } };
+  assert.equal(await call(ev, session), undefined);
+  assert.equal(ev.input.command, "echo protected-value");
+  const insert = { toolName: "insert", input: { anchor: "AAaa", direction: "after", text: "__SECRET_CAP__" } };
+  assert.equal(await call(insert, { hasUI: false }), undefined, "session grant needs no UI");
+  assert.equal(insert.input.text, "protected-value");
+  assert.equal(sessionAsks, 1);
+});
+
+test("extension: permanent allow persists mode=auto and keeps other config", async (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "psm-ext-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const { pi, home } = await loadExtension(tmp, {
+    mode: "ask",
+    allowCommands: ["^ls"],
+    extraSecrets: [{ name: "CAP", value: "protected-value" }],
+  });
+  const call = pi.handlers.get("tool_call")![0];
+  const notified: string[] = [];
+  const ctx = {
+    hasUI: true,
+    ui: { select: async () => "Always allow (save mode=auto to config)", notify: (message: string) => notified.push(message) },
+  };
+  const ev = { toolName: "write", input: { path: "/tmp/x", content: "__SECRET_CAP__" } };
+  assert.equal(await call(ev, ctx), undefined);
+  assert.equal(ev.input.content, "protected-value");
+
+  const saved = JSON.parse(readFileSync(join(home, ".pi", "agent", "extensions", "pi-secret-mask", "config.json"), "utf-8"));
+  assert.equal(saved.mode, "auto", "mode persisted for future sessions");
+  assert.deepEqual(saved.allowCommands, ["^ls"], "unrelated settings survive the rewrite");
+  assert.equal(saved.extraSecrets[0].name, "CAP");
+  assert.match(notified[0] ?? "", /mode=auto/);
+
+  // No further prompts, even in a non-UI context.
+  const next = { toolName: "bash", input: { command: "echo __SECRET_CAP__" } };
+  assert.equal(await call(next, { hasUI: false }), undefined);
+  assert.equal(next.input.command, "echo protected-value");
 });

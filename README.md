@@ -25,9 +25,10 @@ where secrets never enter provider requests or leak back through tool output.
   already registered override public classification.
 - **User-registered secrets**: `/mask-secret` command and `request_secret`
   tool let a user register a secret; the agent only ever sees the placeholder.
-- **Real values where they matter**: bash commands, `write`, and `edit`
-  automatically substitute placeholders back to real values (files store real
-  values; brand-new values are unaffected).
+- **Real values where they matter**: bash commands and file-editing tools
+  (`write`, `edit`, hashline `replace`/`insert`) automatically substitute
+  placeholders back to real values (files store real values; brand-new values
+  are unaffected).
 - **Compaction-safe**: summary messages in compaction and tree navigation are
   masked too.
 
@@ -81,13 +82,20 @@ Registered MY_KEY. Use placeholder __SECRET_MY_KEY__ instead of the real value
 Secrets registered through `/mask-secret` or `request_secret` persist in
 `~/.pi/agent/extensions/pi-secret-mask/secrets.json` (mode 0600) and survive
 restarts. `.env` and automatically detected secrets may not be written there;
-they can be session-only. Use the placeholder in bash commands or `write`/`edit`
-inputs; the extension substitutes the real value locally before execution.
+they can be session-only. Use the placeholder in bash commands or in file-editing
+tool input (`write`, `edit`, `replace`, `insert`); the extension substitutes the
+real value locally before execution.
+
+In `ask` mode the confirmation offers **Allow once**, **Allow for this session**,
+**Always allow (save mode=auto)**, and **Deny**. The session grant lives in memory
+and ends with the process; *Always allow* writes `mode: "auto"` to
+`~/.pi/agent/extensions/pi-secret-mask/config.json` so later sessions stop asking
+(set it back to `ask` to re-enable prompts).
 
 ### Placeholder rules for agents
 
 - A `__SECRET_*__` token shown in tool output or returned by `request_secret` is a redacted alias, not proof that the literal token is stored on disk. A config read showing a placeholder is a masked view, not evidence that the config is invalid.
-- If secret-mask produced the placeholder in the current session, use it directly in bash, `write`, and `edit`; the extension restores the real value locally and masks tool output again. Never print the real value or write the literal placeholder to a config as a fix.
+- If secret-mask produced the placeholder in the current session, use it directly in bash and in file-editing tools (`write`, `edit`, `replace`, `insert`); the extension restores the real value locally and masks tool output again. Never print the real value or write the literal placeholder to a config as a fix.
 - Do not call `request_secret` again when a usable placeholder or local credential already exists. Call it only when the task genuinely needs a secret and no usable credential is available; then keep using the returned placeholder.
 - Do not infer that a secret is missing because `secrets.json` is absent, and do not invent placeholder names. Validate through the intended local operation; request a new secret only if that operation reports invalid credentials.
 
@@ -96,7 +104,7 @@ inputs; the extension substitutes the real value locally before execution.
 | Hook | Action |
 |---|---|
 | `before_provider_request` | Real values -> placeholders across standard message payloads and custom-provider top-level `text` payloads |
-| `tool_call` | bash placeholders -> real values (auto/ask policy); write/edit unmask known whole placeholders; ask/headless gates only when restoration would occur |
+| `tool_call` | bash placeholders -> real values (auto/ask policy); file-editing tools (`write`, `edit`, `replace`, `insert`, plus `writeTools`) unmask known whole placeholders; ask/headless gates only when restoration would occur |
 | `tool_result` | Real values in tool output -> placeholders (prevents reflow) |
 | `session_before_compact` | Summary messages masked too |
 | `session_before_tree` | Branch/tree summary messages masked too |
@@ -112,6 +120,7 @@ non-text (image) content.
 {
   "mode": "ask",
   "allowCommands": [],
+  "writeTools": [],
   "dotenv": { "enabled": true, "files": [".env", ".env.local", ".env.production", ".env.development"], "exclude": [".env.example", ".env.sample"] },
   "patterns": { "openai": true, "github": true, "google": true, "aws": true, "jwt": true, "pem": true, "base64": false },
   "extraSecrets": [],
@@ -119,10 +128,14 @@ non-text (image) content.
 }
 ```
 
-- `mode`: `ask` (default — confirm before bash/write/edit that would restore
-  **known whole** placeholders to real values; print/json and other headless
-  modes block instead of prompting) | `auto` (substitute silently). Unknown or
-  embedded `__SECRET_*__` substrings do not trigger confirmation.
+- `mode`: `ask` (default — before a bash command or file edit would restore
+  **known whole** placeholders to real values, offer once / session / permanent
+  allow / deny; print/json and other headless modes block instead of prompting)
+  | `auto` (substitute silently). Unknown or embedded `__SECRET_*__` substrings
+  do not trigger confirmation.
+- `writeTools`: extra tool names treated as file editors, so their input strings
+  get placeholders restored. Defaults: `write`, `edit`, `replace`, `insert`,
+  `replace_match`.
 - `extraSecrets`: `{ "name", "value" }` pairs always masked (for sensitive
   settings that look public by name)
 - `allowCommands`: full command-string patterns that skip confirmation
@@ -165,6 +178,9 @@ non-text (image) content.
   `.env*` (unknown names default to masked) / were registered manually. The
   narrow `.env` public rule only reduces false positives for ordinary config;
   a secret in an unrecognized format can still pass through.
+- *Allow for this session* and *Always allow* both turn off the pre-restore
+  gate (the latter sets `mode: "auto"`). That trade-off is yours; set `mode`
+  back to `ask` to restore prompting.
 - This extension is defense-in-depth, **not a security boundary**. It runs
   with your user's permissions and cannot protect against malicious prompts,
   hostile repositories, or local exfiltration. Review extension source
